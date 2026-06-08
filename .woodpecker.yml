@@ -1,6 +1,6 @@
 when:
   - event: tag
-    tag: v*
+    ref: refs/tags/v*
 
 variables:
   - &registry    git.tbs.amn.gg
