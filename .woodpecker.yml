@@ -53,6 +53,9 @@ steps:
       platforms: linux/arm64
       dockerfile: queue/Dockerfile
       context: queue/
+      timeout: 30m
+      cache_from: "type=registry,ref=git.tbs.amn.gg/manawenuz/enkodu:buildcache"
+      cache_to: "type=registry,ref=git.tbs.amn.gg/manawenuz/enkodu:buildcache,mode=max"
     when:
       - event: push
         branch: main
@@ -72,6 +75,8 @@ steps:
       platforms: linux/arm64
       dockerfile: queue/Dockerfile
       context: queue/
+      timeout: 30m
+      cache_from: "type=registry,ref=git.tbs.amn.gg/manawenuz/enkodu:buildcache"
     when:
       - event: tag
         ref: refs/tags/v*
