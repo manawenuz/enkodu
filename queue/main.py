@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from typing import Optional
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -509,8 +510,18 @@ def status():
 @app.get("/workers")
 def list_workers():
     now = time.time()
-    return [{"name": n, **w, "online": (now - w["last_seen"]) < 60}
+    return [{"name": n, **w, "online": (now - w["last_seen"]) < 120}
             for n, w in _workers.items()]
+
+class HeartbeatReq(BaseModel):
+    status: str = "idle"
+    current_job: Optional[str] = None
+    current_file: Optional[str] = None
+
+@app.post("/workers/{worker_id}/heartbeat")
+def worker_heartbeat(worker_id: str, req: HeartbeatReq):
+    _worker_update(worker_id, req.status, req.current_job, req.current_file)
+    return {"ok": True}
 
 @app.get("/jobs/next")
 def next_job(worker: str = "unknown"):
@@ -2111,15 +2122,18 @@ async function loadWorkers() {{
     const con = document.getElementById('workers-badges');
     if (!workers.length) {{ sec.style.display='none'; return; }}
     sec.style.display = 'block';
+    const now = Date.now() / 1000;
     con.innerHTML = workers.map(w => {{
-      const dot = w.online ? `<span style="color:${{WORKER_COLORS[w.status]||'#555'}}">●</span>` : '<span style="color:#2a2a4a">●</span>';
-      const sc = w.online ? (WORKER_COLORS[w.status]||'#555') : '#2a2a4a';
-      const sl = w.online ? (w.status||'idle').toUpperCase() : 'OFFLINE';
+      const age = Math.round(now - w.last_seen);
+      const dot = w.online ? `<span style="color:${{WORKER_COLORS[w.status]||'#555'}}">●</span>` : '<span style="color:#c62828">●</span>';
+      const sc = w.online ? (WORKER_COLORS[w.status]||'#555') : '#c62828';
+      const sl = w.online ? (w.status||'idle').toUpperCase() : 'DEAD';
+      const ageStr = w.online ? `<span style="color:#444;font-size:9px">${{age}}s ago</span>` : `<span style="color:#c62828;font-size:9px">last seen ${{age}}s ago</span>`;
       const fl = w.current_file ? `<span style="color:#555;font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{w.current_file}}">${{esc(w.current_file)}}</span>` : '';
-      return `<div style="background:#13132a;border:1px solid #1e1e3a;border-radius:10px;padding:8px 14px;display:inline-flex;align-items:center;gap:8px">
+      return `<div style="background:#13132a;border:1px solid ${{w.online?'#1e1e3a':'#c6282844'}};border-radius:10px;padding:8px 14px;display:inline-flex;align-items:center;gap:8px">
         ${{dot}}<span style="color:#e0e0e0;font-size:12px">${{esc(w.name)}}</span>
         <span style="background:${{sc}}22;color:${{sc}};border:1px solid ${{sc}}44;padding:1px 8px;border-radius:20px;font-size:9px">${{sl}}</span>
-        ${{fl}}</div>`;
+        ${{ageStr}}${{fl}}</div>`;
     }}).join('');
   }} catch(e) {{}}
 }}
