@@ -1,0 +1,63 @@
+when:
+  - event: tag
+    tag: v*
+
+variables:
+  - &registry    git.tbs.amn.gg
+  - &image       git.tbs.amn.gg/manawenuz/enkodu
+  - &arcane_env  5554b43c-0265-4fdb-bb49-2314102e2c0f
+  - &project_id  8db2aeb6-a244-410f-8601-8a8acac21865
+
+steps:
+  - name: build-push
+    image: woodpeckerci/plugin-docker-buildx
+    privileged: true
+    settings:
+      registry: *registry
+      repo: *image
+      tags:
+        - "${CI_COMMIT_TAG##v}"
+      username:
+        from_secret: forgejo_user
+      password:
+        from_secret: forgejo_token
+      platforms: linux/arm64
+      dockerfile: queue/Dockerfile
+      context: queue/
+
+  - name: deploy
+    image: alpine/curl
+    environment:
+      ARCANE_URL:
+        from_secret: arcane_url
+      ARCANE_KEY:
+        from_secret: arcane_key
+    commands:
+      - |
+        set -e
+        VER="${CI_COMMIT_TAG##v}"
+        ENV_ID="5554b43c-0265-4fdb-bb49-2314102e2c0f"
+        PROJECT_ID="8db2aeb6-a244-410f-8601-8a8acac21865"
+        IMAGE="git.tbs.amn.gg/manawenuz/enkodu"
+
+        echo "→ Updating compose to enkodu:$VER"
+        # Substitute image tag in compose file and update Arcane project
+        sed "s|$IMAGE:[^ ]*|$IMAGE:$VER|g" docker-compose.yml > /tmp/compose-deploy.yml
+
+        HTTP=$(curl -s -o /tmp/update.json -w "%{http_code}" \
+          -X PATCH \
+          -H "Authorization: Bearer $ARCANE_KEY" \
+          -F "compose_file=@/tmp/compose-deploy.yml" \
+          "$ARCANE_URL/api/environments/$ENV_ID/projects/$PROJECT_ID")
+        echo "compose update: HTTP $HTTP"
+        cat /tmp/update.json
+
+        echo "→ Redeploying on NAS"
+        HTTP=$(curl -s -o /tmp/deploy.json -w "%{http_code}" \
+          -X POST \
+          -H "Authorization: Bearer $ARCANE_KEY" \
+          "$ARCANE_URL/api/environments/$ENV_ID/projects/$PROJECT_ID/redeploy")
+        echo "redeploy: HTTP $HTTP"
+        cat /tmp/deploy.json
+
+        [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ] && echo "✓ enkodu:$VER deployed" || (echo "✗ deploy failed"; exit 1)

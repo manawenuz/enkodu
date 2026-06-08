@@ -1,0 +1,25 @@
+# Rust build artifacts
+companion/target/
+worker/target/
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Docker build cache
+*.tar.gz
+*.tar
+
+# Secrets — never commit
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

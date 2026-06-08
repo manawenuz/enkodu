@@ -1,0 +1,25 @@
+services:
+  queue:
+    image: git.tbs.amn.gg/manawenuz/enkodu:0.0.1
+    restart: unless-stopped
+    volumes:
+      - /mnt/pool1/pool1_data/home/yulia:/data
+    environment:
+      VIDEOS_ROOT: /data/Videos
+      NAS_UNC_ROOT: \\172.16.81.137\yulia
+      DB_PATH: /data/.transcode/queue.db
+      SCAN_INTERVAL: "300"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.enkodu.rule=Host(`enkodu.manwe.qzz.io`)"
+      - "traefik.http.routers.enkodu.entrypoints=https"
+      - "traefik.http.routers.enkodu.tls=true"
+      - "traefik.http.routers.enkodu.tls.certresolver=main"
+      - "traefik.http.services.enkodu.loadbalancer.server.port=8090"
+    networks:
+      - public
+
+networks:
+  public:
+    external: true
+    name: public
