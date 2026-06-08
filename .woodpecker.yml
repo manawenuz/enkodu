@@ -54,8 +54,8 @@ steps:
       dockerfile: queue/Dockerfile
       context: queue/
       timeout: 30m
-      cache_from: "type=registry,ref=git.tbs.amn.gg/manawenuz/enkodu:buildcache"
-      cache_to: "type=registry,ref=git.tbs.amn.gg/manawenuz/enkodu:buildcache,mode=max"
+      cache_from: "git.tbs.amn.gg/manawenuz/enkodu:buildcache"
+      cache_to: "git.tbs.amn.gg/manawenuz/enkodu:buildcache"
     when:
       - event: push
         branch: main
