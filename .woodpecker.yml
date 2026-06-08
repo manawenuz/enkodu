@@ -14,6 +14,8 @@ steps:
   - name: build-worker-windows
     image: debian:bookworm-slim
     failure: ignore
+    labels:
+      platform: linux/amd64
     environment:
       DEBIAN_FRONTEND: noninteractive
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
@@ -40,6 +42,8 @@ steps:
   - name: build-queue-image-push
     image: woodpeckerci/plugin-docker-buildx
     privileged: true
+    labels:
+      platform: linux/amd64
     settings:
       registry: *registry
       repo: *image
@@ -50,7 +54,7 @@ steps:
         from_secret: ghcr_user
       password:
         from_secret: ghcr_token
-      platforms: linux/arm64
+      platforms: linux/amd64
       dockerfile: queue/Dockerfile
       context: queue/
     when:
@@ -60,6 +64,8 @@ steps:
   - name: build-queue-image-release
     image: woodpeckerci/plugin-docker-buildx
     privileged: true
+    labels:
+      platform: linux/amd64
     settings:
       registry: *registry
       repo: *image
@@ -70,7 +76,7 @@ steps:
         from_secret: ghcr_user
       password:
         from_secret: ghcr_token
-      platforms: linux/arm64
+      platforms: linux/amd64
       dockerfile: queue/Dockerfile
       context: queue/
     when:
