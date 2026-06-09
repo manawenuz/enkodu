@@ -5,6 +5,7 @@ mod reconcile;
 mod scan;
 mod state;
 mod verify;
+mod wanryo;
 
 use anyhow::Result;
 use config::Config;
@@ -157,6 +158,12 @@ fn main() -> Result<()> {
             "httping" => {
                 let url = args.get(2).map(|s| s.as_str()).unwrap_or("https://enkodu.manwe.qzz.io/status");
                 cmd_httping(url);
+                return Ok(());
+            }
+            "wanryo" => {
+                use anyhow::Context as _;
+                let cfg = Config::load().context("load config")?;
+                wanryo::run(&cfg)?;
                 return Ok(());
             }
             _ => {
