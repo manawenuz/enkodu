@@ -2363,6 +2363,7 @@ async function toggleDetail(tr, jobId) {{
           rename output to original filename
         </label>
         <button class="btn-del-orig" onclick="deleteOriginal('${{jobId}}',this)">✕ DELETE ORIGINAL</button>
+        <a class="btn-rescan" href="/jobs/${{jobId}}/output" download style="text-decoration:none">⬇ DOWNLOAD</a>
         ${{rescanBtn}}
        </div>`
     : isPending
