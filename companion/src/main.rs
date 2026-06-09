@@ -61,6 +61,43 @@ struct Tray {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
+// ── diagnostic commands (run directly, no IPC, no tray needed) ───────────────
+
+fn cmd_tcpping(addr: &str) {
+    use std::net::TcpStream;
+    use std::time::Instant;
+    println!("tcpping {} (stdlib TcpStream, 3 attempts)", addr);
+    for i in 1..=3u8 {
+        let t = Instant::now();
+        match TcpStream::connect_timeout(
+            &addr.parse().unwrap_or_else(|_| {
+                // handle bare host — shouldn't happen if user passes host:port
+                "0.0.0.0:0".parse().unwrap()
+            }),
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(_)  => println!("  [{}] ok  {:.1}ms", i, t.elapsed().as_secs_f64() * 1000.0),
+            Err(e) => println!("  [{}] err {}", i, e),
+        }
+    }
+}
+
+fn cmd_httping(url: &str) {
+    use std::time::Instant;
+    println!("httping {} (reqwest blocking, 3 attempts)", url);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client");
+    for i in 1..=3u8 {
+        let t = Instant::now();
+        match client.get(url).send() {
+            Ok(r)  => println!("  [{}] ok  HTTP {}  {:.1}ms", i, r.status(), t.elapsed().as_secs_f64() * 1000.0),
+            Err(e) => println!("  [{}] err {}", i, e),
+        }
+    }
+}
+
 pub fn batch_bg(cfg: Config, mac_drain: bool) {
     if mac_drain {
         info!("Batch scan skipped — Mac submissions paused");
@@ -108,13 +145,27 @@ pub fn batch_bg(cfg: Config, mac_drain: bool) {
 }
 
 fn main() -> Result<()> {
-    // ── CLI mode: forward command to running instance via Unix socket ─────────
+    // ── CLI mode ──────────────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
-        let cmd = args[1..].join(" ");
-        match ipc::send_cmd(&cmd) {
-            Ok(resp) => { println!("{}", resp); return Ok(()); }
-            Err(e)   => { eprintln!("enkodu: {}", e); std::process::exit(1); }
+        match args[1].as_str() {
+            "tcpping" => {
+                let addr = args.get(2).map(|s| s.as_str()).unwrap_or("172.16.81.137:443");
+                cmd_tcpping(addr);
+                return Ok(());
+            }
+            "httping" => {
+                let url = args.get(2).map(|s| s.as_str()).unwrap_or("https://enkodu.manwe.qzz.io/status");
+                cmd_httping(url);
+                return Ok(());
+            }
+            _ => {
+                let cmd = args[1..].join(" ");
+                match ipc::send_cmd(&cmd) {
+                    Ok(resp) => { println!("{}", resp); return Ok(()); }
+                    Err(e)   => { eprintln!("enkodu: {}", e); std::process::exit(1); }
+                }
+            }
         }
     }
 
@@ -518,10 +569,7 @@ fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
                 }
             }
             Err(e) => {
-                let was_online = state.read().unwrap().online;
-                if was_online {
-                    warn!("Server unreachable: {}", e);
-                }
+                warn!("Server unreachable: {:#}", e);
                 state.write().unwrap().online = false;
             }
         }
