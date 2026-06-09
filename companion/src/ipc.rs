@@ -2,25 +2,41 @@
 //!
 //! This module provides the IPC server that runs inside the tray process
 //! and the client that CLI commands use to send commands to the running instance.
+//!
+//! Note: This module is Unix-only. For Windows, see platform/windows.rs IPC implementation.
 
+#[cfg(unix)]
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use log::{info, warn};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::sync::{Arc, RwLock};
+#[cfg(unix)]
 use std::thread;
 
+#[cfg(unix)]
 use crate::api;
+#[cfg(unix)]
 use crate::config::Config;
+#[cfg(unix)]
 use crate::core::ServerState;
+#[cfg(unix)]
 use crate::scan;
+#[cfg(unix)]
 use crate::reconcile;
+#[cfg(unix)]
 use crate::platform;
 
+#[cfg(unix)]
 pub const SOCK_PATH: &str = "/tmp/enkodu.sock";
 
 // ── server (runs inside the tray process) ────────────────────────────────────
 
+#[cfg(unix)]
 pub fn start_server(cfg: Config, state: Arc<RwLock<ServerState>>) {
     let _ = std::fs::remove_file(SOCK_PATH);
     let listener = match UnixListener::bind(SOCK_PATH) {
@@ -43,6 +59,7 @@ pub fn start_server(cfg: Config, state: Arc<RwLock<ServerState>>) {
     });
 }
 
+#[cfg(unix)]
 fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<ServerState>>) {
     let mut line = String::new();
     if BufReader::new(&stream).read_line(&mut line).is_err() { return; }
@@ -53,6 +70,7 @@ fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<ServerStat
     let _ = stream.write_all(format!("{}\n", resp).as_bytes());
 }
 
+#[cfg(unix)]
 fn dispatch(
     cmd: &str,
     cfg: &Config,
@@ -139,6 +157,7 @@ fn dispatch(
 
 // ── client (runs when user types `enkodu <cmd>`) ──────────────────────────────
 
+#[cfg(unix)]
 pub fn send_cmd(cmd: &str) -> Result<String> {
     let mut stream = UnixStream::connect(SOCK_PATH)
         .context("enkodu is not running (no socket at /tmp/enkodu.sock)")?;

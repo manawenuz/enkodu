@@ -6,15 +6,19 @@ use anyhow::{Context, Result};
 use log::{info, warn};
 use std::fs;
 use std::io::Read;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+
 use crate::config::Config;
 use crate::core::ServerState;
-use crate::ipc::{send_cmd as unix_send_cmd, start_server as unix_start_server, SOCK_PATH};
 use crate::platform::{Platform, SingleInstanceGuard};
+
+#[cfg(unix)]
+use crate::ipc::{send_cmd as unix_send_cmd, start_server as unix_start_server, SOCK_PATH};
 
 /// Linux platform implementation.
 pub struct LinuxPlatform;
@@ -135,9 +139,19 @@ impl Platform for LinuxPlatform {
             let mut buf = String::new();
             let _ = f.read_to_string(&mut buf);
             if let Ok(pid) = buf.trim().parse::<u32>() {
-                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-                if alive {
-                    anyhow::bail!("enkodu is already running (pid {})", pid);
+                #[cfg(unix)]
+                {
+                    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                    if alive {
+                        anyhow::bail!("enkodu is already running (pid {})", pid);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // On Windows, we can't check process liveness easily without winapi
+                    // For now, assume it's stale and remove it
+                    // TODO: Use winapi to check if process is running
+                    let _ = std::fs::remove_file(&path);
                 }
             }
             let _ = std::fs::remove_file(&path);
@@ -149,11 +163,26 @@ impl Platform for LinuxPlatform {
         Ok(SingleInstanceGuard { path })
     }
 
+    #[cfg(unix)]
     fn start_ipc_server(&self, cfg: Config, state: Arc<std::sync::RwLock<ServerState>>) {
         unix_start_server(cfg, state);
     }
 
+    #[cfg(unix)]
     fn send_ipc_command(&self, cmd: &str) -> Result<String> {
         unix_send_cmd(cmd)
+    }
+
+    #[cfg(not(unix))]
+    fn start_ipc_server(&self, _cfg: Config, _state: Arc<std::sync::RwLock<ServerState>>) {
+        info!("IPC server not available on this platform");
+    }
+
+    #[cfg(not(unix))]
+    fn send_ipc_command(&self, cmd: &str) -> Result<String> {
+        anyhow::bail!(
+            "IPC not available on this platform. Run commands directly: enkodu {}",
+            cmd
+        );
     }
 }
