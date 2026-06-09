@@ -4,56 +4,16 @@ when:
   - event: tag
     ref: refs/tags/v*
 
-labels:
-  platform: linux/amd64
-
 variables:
   - &registry    ghcr.io
   - &image       ghcr.io/manawenuz/enkodu
-  - &arcane_env  5554b43c-0265-4fdb-bb49-2314102e2c0f
-  - &project_id  8db2aeb6-a244-410f-8601-8a8acac21865
 
 steps:
-  - name: build-companion-macos
-    image: joseluisq/rust-linux-darwin-builder:latest
-    commands:
-      - |
-        set -e
-        cd companion
-        rustup target add aarch64-apple-darwin
-        cargo build --locked --release --target aarch64-apple-darwin
-        cp target/aarch64-apple-darwin/release/enkodu ../queue/enkodu-macos
-        ls -lh ../queue/enkodu-macos
-
-  - name: build-worker-windows
-    image: debian:bookworm-slim
-    failure: ignore
-    environment:
-      DEBIAN_FRONTEND: noninteractive
-      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
-    commands:
-      - |
-        set -e
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev gcc-mingw-w64-x86-64
-        rm -rf /var/lib/apt/lists/*
-
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --profile minimal --default-toolchain stable --target x86_64-pc-windows-gnu
-        . "$HOME/.cargo/env"
-
-        [ -f worker/Cargo.toml ] || { echo "worker/ not in repo yet — skipping"; exit 0; }
-        cd worker
-        cargo build --locked --release --target x86_64-pc-windows-gnu
-
-        mkdir -p ../dist
-        cp target/x86_64-pc-windows-gnu/release/yulia-worker.exe ../dist/yulia-worker-windows-x86_64.exe
-        (cd ../dist && sha256sum yulia-worker-windows-x86_64.exe > yulia-worker-windows-x86_64.exe.sha256)
-        ls -lh ../dist
-
   - name: build-queue-image-push
     image: woodpeckerci/plugin-docker-buildx
     privileged: true
+    labels:
+      platform: linux/amd64
     settings:
       registry: *registry
       repo: *image
@@ -74,6 +34,8 @@ steps:
   - name: build-queue-image-release
     image: woodpeckerci/plugin-docker-buildx
     privileged: true
+    labels:
+      platform: linux/amd64
     settings:
       registry: *registry
       repo: *image
@@ -90,6 +52,3 @@ steps:
     when:
       - event: tag
         ref: refs/tags/v*
-
-  # TODO: re-enable deploy step once arcane-cli auth is configured on CI server
-  # - name: deploy
