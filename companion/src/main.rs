@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod ipc;
 mod reconcile;
 mod scan;
 mod state;
@@ -60,7 +61,64 @@ struct Tray {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
+pub fn batch_bg(cfg: Config, mac_drain: bool) {
+    if mac_drain {
+        info!("Batch scan skipped — Mac submissions paused");
+        notify("Enkodu", "Mac submissions paused — scan skipped");
+        return;
+    }
+    notify("Enkodu", "Scanning for eligible videos…");
+    info!("Batch scan: scanning {} directory/ies", cfg.scan.directories.len());
+    for d in &cfg.scan.directories {
+        info!("  scanning {}", d);
+    }
+
+    let files = scan::scan(&cfg);
+    info!("Scan found {} candidate files", files.len());
+
+    let all_paths: Vec<String> = files.iter()
+        .map(|f| f.path.to_string_lossy().to_string())
+        .collect();
+
+    let st = state::load().unwrap_or_default();
+    let eligible: Vec<_> = files.into_iter().filter(|f| {
+        let key = f.path.to_string_lossy().to_string();
+        !matches!(st.get(&key).map(|e| e.status.as_str()), Some("pending" | "active" | "done"))
+    }).collect();
+
+    if let Err(e) = api::post_queue_manifest(&cfg.server_url, &all_paths) {
+        warn!("Failed to post queue manifest: {}", e);
+    }
+
+    info!("Batch: {} files eligible (not yet submitted)", eligible.len());
+
+    if !eligible.is_empty() {
+        notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
+        for (i, f) in eligible.iter().enumerate() {
+            info!("Batch [{}/{}]: {}", i + 1, eligible.len(), f.path.display());
+            submit_bg(cfg.clone(), f.path.clone());
+        }
+        info!("Batch complete");
+    } else {
+        notify("Enkodu", "No new eligible videos found");
+    }
+
+    let all_files = scan::scan(&cfg);
+    reconcile::reconcile(&cfg, &all_files);
+}
+
 fn main() -> Result<()> {
+    // ── CLI mode: forward command to running instance via Unix socket ─────────
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        let cmd = args[1..].join(" ");
+        match ipc::send_cmd(&cmd) {
+            Ok(resp) => { println!("{}", resp); return Ok(()); }
+            Err(e)   => { eprintln!("enkodu: {}", e); std::process::exit(1); }
+        }
+    }
+
+    // ── tray mode ────────────────────────────────────────────────────────────
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     acquire_pid_lock()?;
@@ -81,6 +139,8 @@ fn main() -> Result<()> {
 
     let tray = build_tray(&cfg)?;
     info!("Tray icon registered in menu bar");
+
+    ipc::start_server(cfg.clone(), Arc::clone(&state));
 
     {
         let state = Arc::clone(&state);
@@ -429,55 +489,6 @@ fn submit_bg(cfg: Config, path: PathBuf) {
     ));
 }
 
-fn batch_bg(cfg: Config, mac_drain: bool) {
-    if mac_drain {
-        info!("Batch scan skipped — Mac submissions paused");
-        notify("Enkodu", "Mac submissions paused — scan skipped");
-        return;
-    }
-    notify("Enkodu", "Scanning for eligible videos…");
-    info!("Batch scan: scanning {} directory/ies", cfg.scan.directories.len());
-    for d in &cfg.scan.directories {
-        info!("  scanning {}", d);
-    }
-
-    let files = scan::scan(&cfg);
-    info!("Scan found {} candidate files", files.len());
-
-    // Collect paths before consuming `files` into the eligible filter.
-    let all_paths: Vec<String> = files.iter()
-        .map(|f| f.path.to_string_lossy().to_string())
-        .collect();
-
-    let st = state::load().unwrap_or_default();
-    let eligible: Vec<_> = files.into_iter().filter(|f| {
-        let key = f.path.to_string_lossy().to_string();
-        !matches!(st.get(&key).map(|e| e.status.as_str()), Some("pending" | "active" | "done"))
-    }).collect();
-
-    // Post manifest so the server knows this client's full local queue depth.
-    if let Err(e) = api::post_queue_manifest(&cfg.server_url, &all_paths) {
-        warn!("Failed to post queue manifest: {}", e);
-    }
-
-    info!("Batch: {} files eligible (not yet submitted)", eligible.len());
-
-    if !eligible.is_empty() {
-        notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
-        for (i, f) in eligible.iter().enumerate() {
-            info!("Batch [{}/{}]: {}", i + 1, eligible.len(), f.path.display());
-            submit_bg(cfg.clone(), f.path.clone());
-        }
-        info!("Batch complete");
-    } else {
-        notify("Enkodu", "No new eligible videos found");
-    }
-
-    // Reconcile server done-jobs that have no local output yet.
-    // Re-scan so we include files that may have been skipped above due to state.
-    let all_files = scan::scan(&cfg);
-    reconcile::reconcile(&cfg, &all_files);
-}
 
 // ── background server polling ─────────────────────────────────────────────────
 
