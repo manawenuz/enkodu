@@ -1661,6 +1661,7 @@ a{{color:#f48fb1;text-decoration:none}}
     <button class="btn btn-neutral" onclick="postAndRefresh('/jobs/clear-pending')">✕ 대기 삭제 CLEAR PENDING</button>
     <button class="btn btn-neutral" onclick="post('/jobs/backfill-meta')">⟳ BACKFILL META</button>
     <button class="btn btn-neutral" id="btn-select" onclick="toggleSelectMode()">⊙ SELECT</button>
+    <button class="btn btn-neutral" id="btn-nas-drain" onclick="toggleNasDrain()">⏸ NAS SCAN</button>
     <span class="cmd-badge">명령 COMMAND: <span id="cmd-badge">—</span></span>
   </div>
 
@@ -2693,6 +2694,25 @@ async function postAndRefresh(url) {{
   await loadJobs();
 }}
 
+async function toggleNasDrain() {{
+  const btn = document.getElementById('btn-nas-drain');
+  const paused = btn.classList.contains('active');
+  const next = paused ? 'false' : 'true';
+  await fetch('/settings', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{nas_drain: next}})}});
+  btn.classList.toggle('active', !paused);
+  btn.textContent = !paused ? '▶ NAS SCAN' : '⏸ NAS SCAN';
+}}
+
+async function initNasDrain() {{
+  try {{
+    const s = await fetch('/settings').then(r=>r.json());
+    const paused = s.nas_drain === 'true';
+    const btn = document.getElementById('btn-nas-drain');
+    btn.classList.toggle('active', paused);
+    btn.textContent = paused ? '▶ NAS SCAN' : '⏸ NAS SCAN';
+  }} catch(e) {{}}
+}}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 function tryParse(s) {{
   if (!s) return null;
@@ -2745,6 +2765,7 @@ function init() {{
   loadLive();
   loadWorkers();
   updateSortHeaders();
+  initNasDrain();
 }}
 
 setInterval(loadLive,    3000);
