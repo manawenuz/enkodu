@@ -1,6 +1,8 @@
-use crate::{api, notify, state, verify};
+use crate::{api, state, verify};
 use crate::config::Config;
+use crate::core::now_secs;
 use crate::scan::VideoFile;
+use crate::platform;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -94,7 +96,7 @@ pub fn reconcile(cfg: &Config, local_files: &[VideoFile]) {
     }
 
     if !ambiguous_names.is_empty() {
-        notify(
+        crate::platform::get_platform().notify(
             "Enkodu \u{26a0}",
             &format!(
                 "{} file(s) ambiguous — set path manually in web UI: {}",
@@ -132,13 +134,13 @@ fn handle_match(cfg: Config, job: api::ServerJob, local_path: PathBuf) {
             status: "done".to_string(),
             output_path: Some(output_path.to_string_lossy().to_string()),
         });
-        notify("Enkodu \u{2713}", &format!("Reconcile: linked {}  (already on disk)", name));
+        crate::platform::get_platform().notify("Enkodu \u{2713}", &format!("Reconcile: linked {}  (already on disk)", name));
         return;
     }
 
     // Output not present locally — need to download from server
     info!("Reconcile: downloading {} → {}", job_id, output_path.display());
-    notify("Enkodu", &format!("Reconcile: downloading {}", name));
+    crate::platform::get_platform().notify("Enkodu", &format!("Reconcile: downloading {}", name));
 
     // Wait if verify is still running
     loop {
@@ -153,14 +155,14 @@ fn handle_match(cfg: Config, job: api::ServerJob, local_path: PathBuf) {
     let bar = indicatif::ProgressBar::hidden();
     if let Err(e) = api::download_output(&cfg.server_url, &job_id, &output_path, &bar) {
         warn!("Reconcile: download failed for '{}': {}", name, e);
-        notify("Enkodu \u{2717}", &format!("Reconcile download failed: {}", name));
+        crate::platform::get_platform().notify("Enkodu \u{2717}", &format!("Reconcile download failed: {}", name));
         return;
     }
 
     match verify::probe(&output_path) {
         Ok(info) if info.codec != "av1" => {
             warn!("Reconcile: bad codec '{}' for {}", info.codec, name);
-            notify("Enkodu \u{2717}", &format!("Bad codec after reconcile: {}", name));
+            crate::platform::get_platform().notify("Enkodu \u{2717}", &format!("Bad codec after reconcile: {}", name));
             let _ = std::fs::remove_file(&output_path);
             return;
         }
@@ -177,7 +179,7 @@ fn handle_match(cfg: Config, job: api::ServerJob, local_path: PathBuf) {
     });
 
     info!("Reconcile done: {} ({:.2} GB)", name, out_sz as f64 / 1e9);
-    notify("Enkodu \u{2713}", &format!("Reconcile: {}  ({:.2} GB)", name, out_sz as f64 / 1e9));
+    crate::platform::get_platform().notify("Enkodu \u{2713}", &format!("Reconcile: {}  ({:.2} GB)", name, out_sz as f64 / 1e9));
 }
 
 // ── confidence check ──────────────────────────────────────────────────────────
@@ -208,11 +210,4 @@ fn is_confident_match(local_path: &PathBuf, server: &ServerMeta) -> bool {
         );
     }
     dur_ok && res_ok
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }

@@ -1,3 +1,8 @@
+//! Unix domain socket IPC for inter-process communication.
+//!
+//! This module provides the IPC server that runs inside the tray process
+//! and the client that CLI commands use to send commands to the running instance.
+
 use anyhow::{Context, Result};
 use log::{info, warn};
 use std::io::{BufRead, BufReader, Write};
@@ -7,13 +12,16 @@ use std::thread;
 
 use crate::api;
 use crate::config::Config;
-use crate::notify;
+use crate::core::ServerState;
+use crate::scan;
+use crate::reconcile;
+use crate::platform;
 
 pub const SOCK_PATH: &str = "/tmp/enkodu.sock";
 
 // ── server (runs inside the tray process) ────────────────────────────────────
 
-pub fn start_server(cfg: Config, state: Arc<RwLock<crate::ServerState>>) {
+pub fn start_server(cfg: Config, state: Arc<RwLock<ServerState>>) {
     let _ = std::fs::remove_file(SOCK_PATH);
     let listener = match UnixListener::bind(SOCK_PATH) {
         Ok(l) => l,
@@ -35,7 +43,7 @@ pub fn start_server(cfg: Config, state: Arc<RwLock<crate::ServerState>>) {
     });
 }
 
-fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<crate::ServerState>>) {
+fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<ServerState>>) {
     let mut line = String::new();
     if BufReader::new(&stream).read_line(&mut line).is_err() { return; }
     let cmd = line.trim().to_string();
@@ -45,20 +53,52 @@ fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<crate::Ser
     let _ = stream.write_all(format!("{}\n", resp).as_bytes());
 }
 
-fn dispatch(cmd: &str, cfg: &Config, state: &Arc<RwLock<crate::ServerState>>) -> String {
+fn dispatch(
+    cmd: &str,
+    cfg: &Config,
+    state: &Arc<RwLock<ServerState>>,
+) -> String {
     match cmd {
         "scan" => {
             let cfg2 = cfg.clone();
             let mac_drain = state.read().unwrap().mac_drain;
-            thread::spawn(move || crate::batch_bg(cfg2, mac_drain));
+            thread::spawn(move || {
+                let platform = crate::platform::get_platform();
+                if mac_drain {
+                    platform.notify("Enkodu", "Mac submissions paused — scan skipped");
+                    return;
+                }
+                platform.notify("Enkodu", "Scanning for eligible videos...");
+                let files = scan::scan(&cfg2);
+                let all_paths: Vec<String> = files.iter()
+                    .map(|f| f.path.to_string_lossy().to_string())
+                    .collect();
+                let st = crate::state::load().unwrap_or_default();
+                let eligible: Vec<_> = files.into_iter().filter(|f| {
+                    let key = f.path.to_string_lossy().to_string();
+                    !matches!(st.get(&key).map(|e| e.status.as_str()), Some("pending" | "active" | "done"))
+                }).collect();
+                if !eligible.is_empty() {
+                    platform.notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
+                    for f in eligible {
+                        let cfg3 = cfg2.clone();
+                        thread::spawn(move || {
+                            crate::core::submit::submit_bg(cfg3, f.path);
+                        });
+                    }
+                } else {
+                    platform.notify("Enkodu", "No new eligible videos found");
+                }
+            });
             "ok: batch scan triggered".to_string()
         }
         "reconcile" => {
             let cfg2 = cfg.clone();
             thread::spawn(move || {
-                notify("Enkodu", "Reconcile: scanning local files…");
-                let files = crate::scan::scan(&cfg2);
-                crate::reconcile::reconcile(&cfg2, &files);
+                let platform = crate::platform::get_platform();
+                platform.notify("Enkodu", "Reconcile: scanning local files...");
+                let files = scan::scan(&cfg2);
+                reconcile::reconcile(&cfg2, &files);
             });
             "ok: reconcile triggered".to_string()
         }
@@ -73,24 +113,24 @@ fn dispatch(cmd: &str, cfg: &Config, state: &Arc<RwLock<crate::ServerState>>) ->
             state.write().unwrap().nas_drain = true;
             let url = cfg.server_url.clone();
             thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", "true"); });
-            notify("Enkodu", "NAS scan paused");
+            crate::platform::get_platform().notify("Enkodu", "NAS scan paused");
             "ok: NAS scan paused".to_string()
         }
         "resume-nas" => {
             state.write().unwrap().nas_drain = false;
             let url = cfg.server_url.clone();
             thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", "false"); });
-            notify("Enkodu", "NAS scan resumed");
+            crate::platform::get_platform().notify("Enkodu", "NAS scan resumed");
             "ok: NAS scan resumed".to_string()
         }
         "pause-mac" => {
             state.write().unwrap().mac_drain = true;
-            notify("Enkodu", "Mac submissions paused");
+            crate::platform::get_platform().notify("Enkodu", "Mac submissions paused");
             "ok: Mac submissions paused".to_string()
         }
         "resume-mac" => {
             state.write().unwrap().mac_drain = false;
-            notify("Enkodu", "Mac submissions resumed");
+            crate::platform::get_platform().notify("Enkodu", "Mac submissions resumed");
             "ok: Mac submissions resumed".to_string()
         }
         other => format!("err: unknown command '{}' — try: scan, reconcile, status, pause-nas, resume-nas, pause-mac, resume-mac", other),
