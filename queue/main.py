@@ -1258,6 +1258,34 @@ async def upload_job(request: Request, x_filename: str = Header(...),
     with db() as conn:
         client_name, _ = _get_or_create_client(conn, ip)
         conn.execute("UPDATE clients SET uploads=uploads+1 WHERE ip=?", (ip,))
+
+        # Dedup: find a done job with identical source_size + matching duration
+        twin = conn.execute("""
+            SELECT id, output_path, output_size, output_meta, verify_status, verify_detail, verify_checks
+            FROM jobs
+            WHERE status='done' AND verify_status='pass'
+              AND source_size=?
+              AND ABS(source_duration_secs - ?) < 2.0
+            LIMIT 1
+        """, (size, duration)).fetchone()
+
+        if twin and twin[1] and os.path.exists(twin[1]):
+            twin_id, twin_out, twin_out_size, twin_out_meta, twin_vs, twin_vd, twin_vc = twin
+            conn.execute("""
+                INSERT INTO jobs (id, source_path, output_path, source_unc, output_unc,
+                    source_size, source_duration_secs, status, priority, source_filename,
+                    source_meta, output_size, output_meta, verify_status, verify_detail,
+                    verify_checks, worker, percent, client_name, created_at, updated_at, client_path)
+                VALUES (?,?,?,?,?,?,?,'done',10,?,?,?,?,?,?,?,?,100.0,?,?,?,?)
+            """, (job_id, str(input_path), twin_out, "", "",
+                  size, duration, orig_filename, json.dumps(meta),
+                  twin_out_size, twin_out_meta, twin_vs, twin_vd, twin_vc,
+                  "dedup", client_name, now, now, client_path))
+            conn.commit()
+            log.info("Companion upload DEDUP [%s/%s]: %s → reusing output from job %s",
+                     client_name, ip, orig_filename, twin_id)
+            return {"job_id": job_id, "priority_position": 0, "client_name": client_name, "deduped": True}
+
         conn.execute("""
             INSERT INTO jobs (id, source_path, output_path, source_unc, output_unc,
                 source_size, source_duration_secs, status, priority, source_filename,
