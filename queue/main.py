@@ -273,6 +273,9 @@ def nas_unc(local_path: Path) -> str:
     return NAS_UNC_ROOT + "\\" + str(rel).replace("/", "\\")
 
 def scan_videos():
+    if _get_setting("nas_drain", "false") == "true":
+        log.info("NAS scan paused (nas_drain=true) — skipping")
+        return 0
     log.info("Scanning %s ...", VIDEOS_ROOT)
     min_size    = int(_get_setting("min_size_mb", "0")) * 1_000_000
     min_height  = int(_get_setting("min_height", "0"))
@@ -1467,6 +1470,7 @@ def get_stats():
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     stall_to = STALL_TIMEOUT
+    nas_data_root = _get_setting("nas_data_root", "/mnt/pool1/pool1_data/home/yulia")
     return f"""<!doctype html>
 <html><head><meta charset=utf-8><title>✦ ENKODU</title>
 <style>
@@ -1841,8 +1845,15 @@ a{{color:#f48fb1;text-decoration:none}}
 
 <script>
 const STALL_TIMEOUT = {stall_to};
+const NAS_DATA_ROOT = {repr(nas_data_root)};
 const STATUS_COLORS = {{pending:'#b39ddb',active:'#f48fb1',done:'#80cbc4',failed:'#ef9a9a'}};
 const STATUS_KR     = {{pending:'대기중',active:'인코딩',done:'완료',failed:'실패'}};
+function nasDisplayPath(p) {{
+  if (!p || !NAS_DATA_ROOT) return p;
+  if (p.startsWith('/data/')) return NAS_DATA_ROOT + p.slice('/data'.length);
+  if (p.startsWith('/data')) return NAS_DATA_ROOT + p.slice('/data'.length);
+  return p;
+}}
 const PHASE_LABELS  = {{encoding:'▶ ENCODING',uploading:'▲ UPLOADING',verifying:'◎ VERIFYING'}};
 const PHASE_CSS     = {{encoding:'phase-encoding',uploading:'phase-uploading',verifying:'phase-verifying'}};
 const WORKER_COLORS = {{encoding:'#f48fb1',uploading:'#80cbc4',verifying:'#ce93d8',idle:'#444'}};
@@ -2334,8 +2345,8 @@ async function toggleDetail(tr, jobId) {{
   const displaySrc  = job.client_path || (isCompanion ? null : job.source_path) || job.source_path || '—';
   const srcLabel    = job.client_path ? 'source' : (isCompanion ? 'original name' : 'source');
   const srcDisplay  = job.client_path ? job.client_path
-                    : (isCompanion ? (job.source_filename || job.source_path) : job.source_path) || '—';
-  const outPath = job.output_path || '—';
+                    : (isCompanion ? (job.source_filename || job.source_path) : nasDisplayPath(job.source_path)) || '—';
+  const outPath = nasDisplayPath(job.output_path) || '—';
   const serverCopyRow = isCompanion && !job.client_path
     ? '<span class="dk" style="color:#333">server copy</span><span style="color:#333;font-size:10px">' + esc(job.source_path||'') + '</span>'
     : '';

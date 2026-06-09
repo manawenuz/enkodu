@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod reconcile;
 mod scan;
 mod state;
 mod verify;
@@ -34,6 +35,8 @@ struct ServerState {
     encoding_phase: String,
     control_cmd: String,
     prev_done: u64,
+    mac_drain: bool,
+    nas_drain: bool,
 }
 
 // ── menu item handles ─────────────────────────────────────────────────────────
@@ -47,6 +50,9 @@ struct Tray {
     webui_item: MenuItem,
     drain_item: MenuItem,
     resume_item: MenuItem,
+    mac_drain_item: CheckMenuItem,
+    nas_drain_item: CheckMenuItem,
+    reconcile_item: MenuItem,
     login_item: CheckMenuItem,
     config_item: MenuItem,
     quit_item: MenuItem,
@@ -56,6 +62,8 @@ struct Tray {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    acquire_pid_lock()?;
 
     let cfg = Config::load()?;
     info!("Enkodu starting — server: {} (build {})", cfg.server_url, env!("GIT_HASH"));
@@ -78,6 +86,11 @@ fn main() -> Result<()> {
         let state = Arc::clone(&state);
         let cfg = cfg.clone();
         thread::spawn(move || poll_loop(cfg, state));
+    }
+
+    {
+        let cfg = cfg.clone();
+        thread::spawn(move || recover_pending_downloads(cfg));
     }
 
     let menu_rx = MenuEvent::receiver();
@@ -113,8 +126,11 @@ fn build_tray(cfg: &Config) -> Result<Tray> {
     let submit_item = MenuItem::new("Submit File…", true, None);
     let batch_item  = MenuItem::new("Batch Scan", true, None);
     let webui_item  = MenuItem::new("Open Web UI", true, None);
-    let drain_item  = MenuItem::new("⏸  Drain Worker", true, None);
-    let resume_item = MenuItem::new("▶  Resume Worker", false, None);
+    let drain_item     = MenuItem::new("⏸  Drain Worker", true, None);
+    let resume_item    = MenuItem::new("▶  Resume Worker", false, None);
+    let mac_drain_item = CheckMenuItem::new("⏸  Pause Mac Submissions", true, false, None);
+    let nas_drain_item = CheckMenuItem::new("⏸  Pause NAS Scan", true, false, None);
+    let reconcile_item = MenuItem::new("Reconcile Server Jobs", true, None);
     let login_item  = CheckMenuItem::new("Start at Login", true, launch_agent_exists(), None);
     let config_item = MenuItem::new("Open Config…", true, None);
     let quit_item   = MenuItem::new("Quit", true, None);
@@ -130,6 +146,11 @@ fn build_tray(cfg: &Config) -> Result<Tray> {
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&drain_item).unwrap();
     menu.append(&resume_item).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    menu.append(&mac_drain_item).unwrap();
+    menu.append(&nas_drain_item).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
+    menu.append(&reconcile_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&login_item).unwrap();
     menu.append(&config_item).unwrap();
@@ -152,6 +173,9 @@ fn build_tray(cfg: &Config) -> Result<Tray> {
         webui_item,
         drain_item,
         resume_item,
+        mac_drain_item,
+        nas_drain_item,
+        reconcile_item,
         login_item,
         config_item,
         quit_item,
@@ -196,6 +220,8 @@ fn update_tray_menu(tray: &Tray, s: &ServerState) {
     let drained = matches!(s.control_cmd.as_str(), "drain" | "stop");
     tray.drain_item.set_enabled(!drained && s.online);
     tray.resume_item.set_enabled(drained && s.online);
+    tray.mac_drain_item.set_checked(s.mac_drain);
+    tray.nas_drain_item.set_checked(s.nas_drain);
 }
 
 // ── menu event handling ───────────────────────────────────────────────────────
@@ -219,7 +245,8 @@ fn handle_event(ev: &muda::MenuEvent, tray: &Tray, cfg: &Config, _state: &Arc<Rw
     } else if ev.id == tray.batch_item.id() {
         info!("Batch scan triggered");
         let cfg = cfg.clone();
-        thread::spawn(move || batch_bg(cfg));
+        let mac_drain = _state.read().unwrap().mac_drain;
+        thread::spawn(move || batch_bg(cfg, mac_drain));
 
     } else if ev.id == tray.webui_item.id() {
         info!("Opening web UI: {}", cfg.server_url);
@@ -234,6 +261,32 @@ fn handle_event(ev: &muda::MenuEvent, tray: &Tray, cfg: &Config, _state: &Arc<Rw
         info!("Resuming worker");
         let url = cfg.server_url.clone();
         thread::spawn(move || { let _ = api::set_control(&url, "run"); });
+
+    } else if ev.id == tray.mac_drain_item.id() {
+        let new_state = !_state.read().unwrap().mac_drain;
+        _state.write().unwrap().mac_drain = new_state;
+        tray.mac_drain_item.set_checked(new_state);
+        info!("Mac submissions {}", if new_state { "paused" } else { "resumed" });
+        notify("Enkodu", if new_state { "Mac submissions paused" } else { "Mac submissions resumed" });
+
+    } else if ev.id == tray.nas_drain_item.id() {
+        let new_state = !_state.read().unwrap().nas_drain;
+        _state.write().unwrap().nas_drain = new_state;
+        tray.nas_drain_item.set_checked(new_state);
+        let url = cfg.server_url.clone();
+        let val = if new_state { "true" } else { "false" };
+        thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", val); });
+        info!("NAS scan {}", if new_state { "paused" } else { "resumed" });
+        notify("Enkodu", if new_state { "NAS scan paused" } else { "NAS scan resumed" });
+
+    } else if ev.id == tray.reconcile_item.id() {
+        info!("Reconcile triggered manually");
+        let cfg = cfg.clone();
+        thread::spawn(move || {
+            notify("Enkodu", "Reconcile: scanning local files…");
+            let files = scan::scan(&cfg);
+            reconcile::reconcile(&cfg, &files);
+        });
 
     } else if ev.id == tray.config_item.id() {
         let _ = open::that(Config::path());
@@ -376,7 +429,12 @@ fn submit_bg(cfg: Config, path: PathBuf) {
     ));
 }
 
-fn batch_bg(cfg: Config) {
+fn batch_bg(cfg: Config, mac_drain: bool) {
+    if mac_drain {
+        info!("Batch scan skipped — Mac submissions paused");
+        notify("Enkodu", "Mac submissions paused — scan skipped");
+        return;
+    }
     notify("Enkodu", "Scanning for eligible videos…");
     info!("Batch scan: scanning {} directory/ies", cfg.scan.directories.len());
     for d in &cfg.scan.directories {
@@ -404,18 +462,21 @@ fn batch_bg(cfg: Config) {
 
     info!("Batch: {} files eligible (not yet submitted)", eligible.len());
 
-    if eligible.is_empty() {
+    if !eligible.is_empty() {
+        notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
+        for (i, f) in eligible.iter().enumerate() {
+            info!("Batch [{}/{}]: {}", i + 1, eligible.len(), f.path.display());
+            submit_bg(cfg.clone(), f.path.clone());
+        }
+        info!("Batch complete");
+    } else {
         notify("Enkodu", "No new eligible videos found");
-        return;
-    }
-    notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
-
-    for (i, f) in eligible.iter().enumerate() {
-        info!("Batch [{}/{}]: {}", i + 1, eligible.len(), f.path.display());
-        submit_bg(cfg.clone(), f.path.clone());
     }
 
-    info!("Batch complete");
+    // Reconcile server done-jobs that have no local output yet.
+    // Re-scan so we include files that may have been skipped above due to state.
+    let all_files = scan::scan(&cfg);
+    reconcile::reconcile(&cfg, &all_files);
 }
 
 // ── background server polling ─────────────────────────────────────────────────
@@ -472,6 +533,11 @@ fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
         if let Ok(cmd) = api::control_status(&cfg.server_url) {
             state.write().unwrap().control_cmd = cmd;
         }
+
+        if let Ok(settings) = api::get_settings(&cfg.server_url) {
+            let nas_drain = settings.get("nas_drain").map(|v| v == "true").unwrap_or(false);
+            state.write().unwrap().nas_drain = nas_drain;
+        }
     }
 }
 
@@ -523,14 +589,177 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
     }
 }
 
+// ── recovery: download completed jobs that were missed while app was closed ──
+
+fn recover_pending_downloads(cfg: Config) {
+    let st = match state::load() {
+        Ok(s) => s,
+        Err(e) => { warn!("Recovery: could not load state: {}", e); return; }
+    };
+
+    let pending: Vec<(String, state::JobEntry)> = st.into_iter()
+        .filter(|(_, e)| !matches!(e.status.as_str(), "done" | "failed"))
+        .collect();
+
+    if pending.is_empty() {
+        info!("Recovery: no pending jobs");
+        return;
+    }
+
+    info!("Recovery: {} unfinished job(s) found — resuming", pending.len());
+    notify("Enkodu", &format!("Resuming {} interrupted job(s)\u{2026}", pending.len()));
+
+    for (file_path, entry) in pending {
+        let cfg = cfg.clone();
+        thread::spawn(move || recover_one(cfg, file_path, entry.job_id));
+    }
+}
+
+fn recover_one(cfg: Config, file_path: String, job_id: String) {
+    let path = std::path::PathBuf::from(&file_path);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+    info!("Recovery: watching job {} ({})", job_id, name);
+
+    loop {
+        thread::sleep(Duration::from_secs(10));
+        let job = match api::poll_job(&cfg.server_url, &job_id) {
+            Ok(j) => j,
+            Err(e) => { warn!("Recovery poll error for {}: {}", job_id, e); continue; }
+        };
+        match job.status.as_str() {
+            "done" => {
+                let vs = job.verify_status.as_deref().unwrap_or("");
+                if vs == "running" { continue; }
+                if vs == "fail" {
+                    error!("Recovery: server verify failed for {}", name);
+                    notify("Enkodu \u{2717}", &format!("Verify failed: {}", name));
+                    let _ = state::upsert(&file_path, state::JobEntry {
+                        job_id, submitted_at: 0, status: "failed".to_string(), output_path: None,
+                    });
+                    return;
+                }
+                break;
+            }
+            "failed" => {
+                error!("Recovery: job {} failed: {}", job_id, job.error.as_deref().unwrap_or("?"));
+                notify("Enkodu \u{2717}", &format!("{} failed on server", name));
+                let _ = state::upsert(&file_path, state::JobEntry {
+                    job_id, submitted_at: 0, status: "failed".to_string(), output_path: None,
+                });
+                return;
+            }
+            _ => continue,
+        }
+    }
+
+    let output_name = path.with_file_name(format!(
+        "{}_av1.mp4",
+        path.file_stem().and_then(|s| s.to_str()).unwrap_or("output")
+    ));
+
+    info!("Recovery: downloading {} to {}", job_id, output_name.display());
+    notify("Enkodu", &format!("Downloading: {}", name));
+
+    let bar = indicatif::ProgressBar::hidden();
+    if let Err(e) = api::download_output(&cfg.server_url, &job_id, &output_name, &bar) {
+        error!("Recovery: download failed for {}: {}", name, e);
+        notify("Enkodu \u{2717}", &format!("Download failed: {}", name));
+        return;
+    }
+
+    // Codec-only check — server already validated duration/frames
+    match verify::probe(&output_name) {
+        Ok(info) if info.codec != "av1" => {
+            error!("Recovery: output codec is '{}', expected av1", info.codec);
+            notify("Enkodu \u{2717}", &format!("Bad codec after download: {}", name));
+            let _ = std::fs::remove_file(&output_name);
+            return;
+        }
+        Err(e) => warn!("Recovery: probe warning for {}: {}", name, e),
+        _ => {}
+    }
+
+    let out_sz = output_name.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = state::upsert(&file_path, state::JobEntry {
+        job_id,
+        submitted_at: 0,
+        status: "done".to_string(),
+        output_path: Some(output_name.to_string_lossy().to_string()),
+    });
+
+    info!("Recovery done: {} ({:.2} GB)", name, out_sz as f64 / 1e9);
+    notify("Enkodu \u{2713}", &format!("Recovered: {}  ({:.2} GB)", name, out_sz as f64 / 1e9));
+}
+
+// ── pid lock — prevent multiple instances ────────────────────────────────────
+
+fn pid_lock_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("enkodu.lock")
+}
+
+fn acquire_pid_lock() -> Result<()> {
+    use std::io::{Read, Write};
+    let path = pid_lock_path();
+
+    // Check if a lock file exists with a live PID
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let mut buf = String::new();
+        let _ = f.read_to_string(&mut buf);
+        if let Ok(pid) = buf.trim().parse::<u32>() {
+            // On Unix, kill -0 checks if process exists without signalling it
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+            if alive {
+                eprintln!("enkodu is already running (pid {}). Exiting.", pid);
+                std::process::exit(0);
+            }
+        }
+        // Stale lock — remove it
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Write our PID
+    let pid = std::process::id();
+    std::fs::write(&path, format!("{}", pid))?;
+
+    // Remove lock file on exit via atexit
+    let path_clone = path.clone();
+    unsafe {
+        LOCK_PATH = Some(path_clone);
+        libc::atexit(remove_lock_on_exit);
+    }
+
+    Ok(())
+}
+
+static mut LOCK_PATH: Option<std::path::PathBuf> = None;
+
+extern "C" fn remove_lock_on_exit() {
+    unsafe {
+        if let Some(ref p) = LOCK_PATH {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn notify(title: &str, body: &str) {
     info!("[notify] {}: {}", title, body);
-    let _ = notify_rust::Notification::new()
-        .summary(title)
-        .body(body)
-        .show();
+    // Use osascript directly — notify_rust triggers a "Choose Application" dialog
+    // on macOS because it registers a click-action handler named "use_default".
+    let script = format!(
+        "display notification {} with title {}",
+        applescript_quote(body),
+        applescript_quote(title),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output();
+}
+
+fn applescript_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn truncate(s: &str, n: usize) -> String {

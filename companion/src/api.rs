@@ -181,6 +181,60 @@ pub fn set_control(server_url: &str, cmd: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerJob {
+    pub id: String,
+    pub source_filename: Option<String>,
+    pub source_meta: Option<String>,
+    pub source_path: Option<String>,
+    pub client_path: Option<String>,
+    pub output_size: Option<u64>,
+    pub verify_status: Option<String>,
+}
+
+pub fn list_done_companion_jobs(server_url: &str) -> Result<Vec<ServerJob>> {
+    #[derive(Deserialize)]
+    struct Resp { jobs: Vec<ServerJob> }
+    let resp = client_upload()
+        .get(format!("{}/jobs?status=done&limit=2000", server_url))
+        .send()
+        .context("GET /jobs")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("list jobs: HTTP {}", resp.status());
+    }
+    // Return all done jobs — reconcile will prefer NAS jobs (proper paths) over
+    // companion upload jobs (source under /.transcode/uploads/) for the same file.
+    Ok(resp.json::<Resp>().context("parse jobs")?.jobs)
+}
+
+pub fn set_client_path(server_url: &str, job_id: &str, path: &str) -> Result<()> {
+    let body = serde_json::json!({ "client_path": path });
+    client()
+        .post(format!("{}/jobs/{}/set-path", server_url, job_id))
+        .json(&body)
+        .send()
+        .context("POST /jobs/{id}/set-path")?;
+    Ok(())
+}
+
+pub fn get_settings(server_url: &str) -> Result<std::collections::HashMap<String, String>> {
+    let resp = client()
+        .get(format!("{}/settings", server_url))
+        .send()
+        .context("GET /settings")?;
+    resp.json().context("parse settings")
+}
+
+pub fn set_setting(server_url: &str, key: &str, value: &str) -> Result<()> {
+    let body = serde_json::json!({ key: value });
+    client()
+        .post(format!("{}/settings", server_url))
+        .json(&body)
+        .send()
+        .context("POST /settings")?;
+    Ok(())
+}
+
 pub fn post_queue_manifest(server_url: &str, files: &[String]) -> Result<()> {
     let body = serde_json::json!({ "files": files });
     client()

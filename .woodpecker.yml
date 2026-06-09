@@ -14,6 +14,17 @@ variables:
   - &project_id  8db2aeb6-a244-410f-8601-8a8acac21865
 
 steps:
+  - name: build-companion-macos
+    image: joseluisq/rust-linux-darwin-builder:latest
+    commands:
+      - |
+        set -e
+        cd companion
+        rustup target add aarch64-apple-darwin
+        cargo build --locked --release --target aarch64-apple-darwin
+        cp target/aarch64-apple-darwin/release/enkodu ../queue/enkodu-macos
+        ls -lh ../queue/enkodu-macos
+
   - name: build-worker-windows
     image: debian:bookworm-slim
     failure: ignore
