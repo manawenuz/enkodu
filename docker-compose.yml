@@ -1,6 +1,7 @@
 services:
   queue:
-    image: ghcr.io/manawenuz/enkodu:main
+    image: yulia-queue:latest
+    pull_policy: never
     restart: unless-stopped
     volumes:
       - /mnt/pool1/pool1_data/home/yulia:/data
