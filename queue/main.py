@@ -1349,8 +1349,9 @@ class AdminInviteReq(BaseModel):
 @app.post("/auth/admin/invite")
 def admin_invite(req: AdminInviteReq, request: Request):
     """Generate a new passkey setup URL for an existing user. Requires API token."""
-    if not _has_api_token(request):
-        raise HTTPException(401, "API token required")
+    session_user = _current_user(request)
+    if not _has_api_token(request) and not (session_user and session_user.get("role") == "admin"):
+        raise HTTPException(401, "API token or admin session required")
     with db() as conn:
         user = conn.execute(
             "SELECT * FROM auth_users WHERE username=? AND enabled=1",
