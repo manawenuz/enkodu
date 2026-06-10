@@ -1342,6 +1342,25 @@ def auth_logout(request: Request):
     _clear_session_cookie(response, request)
     return response
 
+class AdminInviteReq(BaseModel):
+    username: str
+    expires_in: int = 3600  # seconds
+
+@app.post("/auth/admin/invite")
+def admin_invite(req: AdminInviteReq, request: Request):
+    """Generate a new passkey setup URL for an existing user. Requires API token."""
+    if not _has_api_token(request):
+        raise HTTPException(401, "API token required")
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM auth_users WHERE username=? AND enabled=1",
+            (req.username,),
+        ).fetchone()
+        if not user:
+            raise HTTPException(404, f"user '{req.username}' not found")
+        token = _create_invite(conn, user["id"], req.expires_in)
+    return {"ok": True, "setup_url": _setup_url(token), "expires_in_secs": req.expires_in}
+
 class BootstrapReq(BaseModel):
     username: str
     display_name: str | None = None
@@ -3533,6 +3552,23 @@ a{{color:#f48fb1;text-decoration:none}}
     <div class="settings-desc">Files queued in companion apps waiting to be uploaded. Companion must call <code style="color:#80cbc4;font-size:10px">POST /clients/queue-manifest</code> to register its local queue.</div>
     <div id="companion-queue-list" style="color:#444;font-size:11px">loading…</div>
   </div>
+
+  <div class="settings-card">
+    <div class="settings-title">PASSKEY MANAGEMENT</div>
+    <div class="settings-desc">Generate a one-time setup URL to register a new passkey for an existing user. The link expires in 1 hour and is single-use.</div>
+    <div class="settings-grid">
+      <div class="settings-label">Username</div>
+      <input class="sinput" type="text" id="pk-username" placeholder="e.g. manwe" style="font-size:12px">
+    </div>
+    <button class="btn-save" onclick="generateInvite()" style="margin-top:14px">GENERATE SETUP LINK</button>
+    <span class="save-ok" id="pk-ok" style="display:none"></span>
+    <div id="pk-result" style="display:none;margin-top:14px;padding:12px;background:#0d0d1a;border:1px solid #303050;border-radius:6px">
+      <div style="color:#80cbc4;font-size:10px;letter-spacing:2px;margin-bottom:6px">SETUP URL (1 HOUR)</div>
+      <div id="pk-url" style="color:#ce93d8;font-size:11px;word-break:break-all;cursor:pointer" onclick="copyInviteUrl()" title="Click to copy"></div>
+      <div style="color:#444;font-size:10px;margin-top:6px">Click URL to copy · opens in a new tab once you paste it</div>
+    </div>
+    <div id="pk-error" style="display:none;color:#ef9a9a;font-size:11px;margin-top:8px"></div>
+  </div>
 </div>
 
 <!-- ── REPORT TAB ── -->
@@ -4459,6 +4495,38 @@ async function saveSettings() {{
   setTimeout(() => {{ ok.style.opacity = 0; }}, 2500);
 }}
 
+// ── passkey invite ─────────────────────────────────────────────────────────────
+async function generateInvite() {{
+  const username = document.getElementById('pk-username').value.trim();
+  const errEl = document.getElementById('pk-error');
+  const resEl = document.getElementById('pk-result');
+  const urlEl = document.getElementById('pk-url');
+  errEl.style.display = 'none';
+  resEl.style.display = 'none';
+  if (!username) {{ errEl.textContent = 'Enter a username'; errEl.style.display = 'block'; return; }}
+  try {{
+    const r = await fetch('/auth/admin/invite', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{username}})
+    }});
+    const data = await r.json();
+    if (!r.ok) {{ errEl.textContent = data.detail || 'Error'; errEl.style.display = 'block'; return; }}
+    urlEl.textContent = data.setup_url;
+    resEl.style.display = 'block';
+  }} catch (e) {{
+    errEl.textContent = String(e); errEl.style.display = 'block';
+  }}
+}}
+function copyInviteUrl() {{
+  const url = document.getElementById('pk-url').textContent;
+  navigator.clipboard.writeText(url).then(() => {{
+    const el = document.getElementById('pk-url');
+    el.textContent = '✓ copied — ' + url;
+    setTimeout(() => {{ el.textContent = url; }}, 2000);
+  }});
+}}
+
 // ── control ───────────────────────────────────────────────────────────────────
 async function ctrl(cmd) {{
   ['run','drain','stop'].forEach(c => document.getElementById('btn-'+c).classList.remove('active'));
@@ -5025,12 +5093,13 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
             await ws.close(code=4401)
             return
 
-    # Always require companion to be registered (even when AUTH_ENABLED=False)
-    with db() as conn:
-        _reg_row = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
-    if not _reg_row:
-        await ws.close(code=4401, reason="unregistered companion")
-        return
+    # Companions must be registered; workers connect directly by name
+    if kind == "companion":
+        with db() as conn:
+            _reg_row = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if not _reg_row:
+            await ws.close(code=4401, reason="unregistered companion")
+            return
 
     await ws.accept()
 

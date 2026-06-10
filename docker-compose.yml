@@ -1,7 +1,7 @@
 services:
   queue:
-    image: yulia-queue:latest
-    pull_policy: never
+    image: ghcr.io/manawenuz/enkodu:main
+    pull_policy: always
     restart: unless-stopped
     volumes:
       - /mnt/pool1/pool1_data/home/yulia:/data
@@ -10,6 +10,16 @@ services:
       NAS_UNC_ROOT: \\172.16.81.137\yulia
       DB_PATH: /data/.transcode/queue.db
       SCAN_INTERVAL: "300"
+      AUTH_ENABLED: "true"
+      AUTH_PUBLIC_ORIGIN: "https://enkodu.manwe.qzz.io"
+      AUTH_RP_ID: "enkodu.manwe.qzz.io"
+      AUTH_RP_NAME: "Enkodu"
+      AUTH_COOKIE_SECURE: "true"
+      AUTH_SESSION_SECRET: "${AUTH_SESSION_SECRET}" # gitleaks:allow
+      AUTH_API_TOKEN: "${AUTH_API_TOKEN}" # gitleaks:allow
+      AUTH_WORKER_TOKEN: "${AUTH_WORKER_TOKEN}" # gitleaks:allow
+      AUTH_COMPANION_TOKEN: "${AUTH_COMPANION_TOKEN}" # gitleaks:allow
+      AUTH_LEGACY_MACHINE_ACCESS: "false"
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.enkodu.rule=Host(`enkodu.manwe.qzz.io`)"
