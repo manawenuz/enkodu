@@ -1342,6 +1342,29 @@ def auth_logout(request: Request):
     _clear_session_cookie(response, request)
     return response
 
+class BootstrapReq(BaseModel):
+    username: str
+    display_name: str | None = None
+    role: str = "admin"
+
+@app.post("/auth/bootstrap")
+def auth_bootstrap(req: BootstrapReq):
+    """One-time first-user setup. Only works when auth_users table is empty."""
+    now = _now()
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM auth_users").fetchone()[0]
+        if count > 0:
+            raise HTTPException(403, "bootstrap disabled: users already exist")
+        user_id = str(uuid.uuid4())
+        conn.execute("""
+            INSERT INTO auth_users
+                (id, username, display_name, email, role, source, enabled, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,1,?,?)
+        """, (user_id, req.username, req.display_name or req.username,
+              None, req.role, "local", now, now))
+        token = _create_invite(conn, user_id, 3600)
+    return {"ok": True, "setup_url": _setup_url(token), "expires_in_secs": 3600}
+
 @app.get("/auth/jellyfin/login", response_class=HTMLResponse)
 def jellyfin_login_page(next: str = "/"):
     if not JELLYFIN_ENABLED:
