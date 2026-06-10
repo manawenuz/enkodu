@@ -84,15 +84,43 @@ fn test_encoder(ffmpeg: &str, encoder: &str) -> bool {
 }
 
 fn detect_decoders(ffmpeg: &str) -> Vec<String> {
-    // Check which hardware decoders exist by listing decoders
+    // Check which decoders are listed in `ffmpeg -decoders` output.
+    // Parse line by line to avoid false positives from substring matching.
     let out = Command::new(ffmpeg)
         .args(["-hide_banner", "-decoders"])
         .output();
-    let text = match out {
+    let raw = match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(_) => return vec![],
     };
-    let hw_decoders = [
+
+    // Each decoder entry line starts with flags then the codec name, e.g.:
+    //  " V..... av1                  Alliance for Open Media AV1 ..."
+    // We collect all codec names that appear in video/audio decoder lines.
+    let present: Vec<String> = raw
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            // Decoder lines start with a letter flag (V=video, A=audio, S=subtitle, …)
+            // followed by more flag chars. Skip header/comment lines.
+            if trimmed.starts_with('V') || trimmed.starts_with('A') || trimmed.starts_with('S') {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let target_decoders = [
+        "av1",
+        "libdav1d",
+        "hevc",
+        "h264",
         "av1_qsv",
         "av1_cuvid",
         "hevc_qsv",
@@ -100,13 +128,10 @@ fn detect_decoders(ffmpeg: &str) -> Vec<String> {
         "h264_qsv",
         "h264_cuvid",
     ];
+
     let mut found = Vec::new();
-    // Always include software decoders if ffmpeg is available
-    if !text.is_empty() {
-        found.extend(["av1", "hevc", "h264"].iter().map(|s| s.to_string()));
-    }
-    for dec in &hw_decoders {
-        if text.contains(dec) {
+    for dec in &target_decoders {
+        if present.iter().any(|d| d == dec) {
             found.push(dec.to_string());
         }
     }

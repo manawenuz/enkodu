@@ -1158,13 +1158,29 @@ fn process_job(cfg: &Config, job: &Job, ffmpeg_child: &Arc<Mutex<Option<Child>>>
 
     // Select the pre-detected encoder for this job's target codec.
     let target_codec = OutputCodec::from_str(&job.output_codec);
-    let encoder = match &target_codec {
+    let selected_encoder = match &target_codec {
         OutputCodec::Av1 => &cfg.encoder_av1,
         OutputCodec::Hevc => &cfg.encoder_hevc,
         OutputCodec::H264 => &cfg.encoder_h264,
     };
+    if selected_encoder.is_empty() {
+        log_error(
+            cfg,
+            Some(&job.id),
+            &format!(
+                "No working encoder found for {:?}, failing job {}",
+                target_codec, job.id
+            ),
+        );
+        report_failed(
+            cfg,
+            &job.id,
+            "No hardware or software encoder available for requested codec",
+        );
+        return Ok(false);
+    }
     let mut job_cfg = cfg.clone();
-    job_cfg.apply_detected_encoder(encoder.clone());
+    job_cfg.apply_detected_encoder(selected_encoder.clone());
 
     log_info(cfg, Some(&job.id), "Downloading source...");
     download_source(cfg, job, &input)?;
@@ -1302,7 +1318,11 @@ fn ws_worker_loop(
                     "platform": current_platform(),
                     "version": VERSION,
                     "capabilities": {
-                        "encoders": [&cfg.encoder_av1, &cfg.encoder_hevc, &cfg.encoder_h264],
+                        "encoders": {
+                            "av1": &cfg.encoder_av1,
+                            "hevc": &cfg.encoder_hevc,
+                            "h264": &cfg.encoder_h264,
+                        },
                         "decoders": ["av1", "hevc", "h264"],
                         "ffprobe_available": true,
                     }
@@ -1465,11 +1485,17 @@ fn main() {
             "diagnostics" => {
                 let mut cfg = Config::from_env();
                 init_log(&cfg.log_dir);
-                let av1 = detect_encoder(&cfg, &OutputCodec::Av1);
-                cfg.apply_detected_encoder(av1.clone());
-                cfg.encoder_av1 = av1;
-                cfg.encoder_hevc = detect_encoder(&cfg, &OutputCodec::Hevc);
-                cfg.encoder_h264 = detect_encoder(&cfg, &OutputCodec::H264);
+                let mut test_cfg_av1 = cfg.clone();
+                let encoder_av1 = detect_encoder(&test_cfg_av1, &OutputCodec::Av1);
+                let mut test_cfg_hevc = cfg.clone();
+                let encoder_hevc = detect_encoder(&test_cfg_hevc, &OutputCodec::Hevc);
+                let mut test_cfg_h264 = cfg.clone();
+                let encoder_h264 = detect_encoder(&test_cfg_h264, &OutputCodec::H264);
+                let _ = (&mut test_cfg_av1, &mut test_cfg_hevc, &mut test_cfg_h264);
+                cfg.encoder_av1 = encoder_av1.clone();
+                cfg.encoder_hevc = encoder_hevc;
+                cfg.encoder_h264 = encoder_h264;
+                cfg.apply_detected_encoder(encoder_av1);
                 std::process::exit(if run_diagnostics(&cfg) { 0 } else { 1 });
             }
             other => {
@@ -1491,11 +1517,21 @@ fn main() {
     }
 
     {
-        let av1 = detect_encoder(&cfg, &OutputCodec::Av1);
-        cfg.apply_detected_encoder(av1.clone());
-        cfg.encoder_av1 = av1;
-        cfg.encoder_hevc = detect_encoder(&cfg, &OutputCodec::Hevc);
-        cfg.encoder_h264 = detect_encoder(&cfg, &OutputCodec::H264);
+        let mut test_cfg_av1 = cfg.clone();
+        let encoder_av1 = detect_encoder(&test_cfg_av1, &OutputCodec::Av1);
+        let mut test_cfg_hevc = cfg.clone();
+        let encoder_hevc = detect_encoder(&test_cfg_hevc, &OutputCodec::Hevc);
+        let mut test_cfg_h264 = cfg.clone();
+        let encoder_h264 = detect_encoder(&test_cfg_h264, &OutputCodec::H264);
+        // Suppress unused_mut warnings — clones are passed as &mut to detect_encoder
+        // but detection only reads cfg; assignments below ensure the names are used.
+        let _ = (&mut test_cfg_av1, &mut test_cfg_hevc, &mut test_cfg_h264);
+        cfg.encoder_av1 = encoder_av1.clone();
+        cfg.encoder_hevc = encoder_hevc;
+        cfg.encoder_h264 = encoder_h264;
+        // Set cfg.encoder to the AV1 encoder so build_encode_args has a sane default
+        // for legacy callers; the per-job path uses encoder_av1/hevc/h264 directly.
+        cfg.apply_detected_encoder(encoder_av1);
     }
 
     log_info(

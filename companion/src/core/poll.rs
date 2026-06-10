@@ -11,10 +11,15 @@ use crate::core::ServerState;
 
 /// Poll the queue server for status updates.
 /// This runs in a background thread and updates the shared state.
-pub fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
+/// Accepts Arc<RwLock<Config>> so that config updates pushed via WS
+/// (server_url, auth_token changes) are reflected in each poll cycle.
+pub fn poll_loop(live_cfg: Arc<RwLock<Config>>, state: Arc<RwLock<ServerState>>) {
     info!("Poll loop started — polling every 5s");
     loop {
         thread::sleep(Duration::from_secs(5));
+
+        // Re-read config each cycle so WS-applied updates are visible
+        let cfg = live_cfg.read().unwrap().clone();
 
         // Poll queue status
         match api::queue_status(&cfg.server_url, cfg.auth_token.as_deref()) {

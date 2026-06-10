@@ -24,7 +24,7 @@ mod platform;
 use anyhow::Result;
 use config::Config;
 use core::{batch, commands, poll, submit, truncate, ServerState};
-use log::info;
+use log::{info, warn};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -147,15 +147,30 @@ fn main() -> Result<()> {
     // Start IPC server
     platform.start_ipc_server(cfg.clone(), Arc::clone(&state));
 
-    // Detect capabilities and register with server
-    let caps = capabilities::detect(
-        &verify::find_ffmpeg(),
-        &verify::find_ffprobe(),
-    );
+    // Detect capabilities in a background thread so startup is not blocked
+    // by the 17 sequential test encodes (can take 30-50s on slow machines).
+    // We give detection up to 30s; if it times out we start with empty capabilities
+    // and the companion will re-register once the user triggers it again.
+    let (caps_tx, caps_rx) = std::sync::mpsc::channel::<capabilities::Capabilities>();
+    {
+        let ffmpeg_path = verify::find_ffmpeg();
+        let ffprobe_path = verify::find_ffprobe();
+        thread::spawn(move || {
+            let caps = capabilities::detect(&ffmpeg_path, &ffprobe_path);
+            let _ = caps_tx.send(caps);
+        });
+    }
+    let caps = caps_rx
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap_or_else(|_| {
+            warn!("Capability detection timed out after 30s — starting with empty capabilities");
+            capabilities::Capabilities::default()
+        });
+
     // Register + report capabilities via HTTP (quick, on startup)
     {
         let cfg_snap = live_cfg.read().unwrap().clone();
-        let _ = register_with_server(&cfg_snap, &caps);
+        let _ = register_with_server(&cfg_snap, &caps, Arc::clone(&live_cfg));
     }
     // Start WebSocket client
     ws_client::start(Arc::clone(&live_cfg), caps);
@@ -172,11 +187,11 @@ fn main() -> Result<()> {
     let tray = build_tray(&cfg, &state)?;
     info!("Tray icon registered in menu bar");
 
-    // Start background poll loop
+    // Start background poll loop — pass live_cfg so config updates from WS are reflected
     {
         let state = Arc::clone(&state);
-        let cfg = cfg.clone();
-        thread::spawn(move || poll::poll_loop(cfg, state));
+        let live_cfg_poll = Arc::clone(&live_cfg);
+        thread::spawn(move || poll::poll_loop(live_cfg_poll, state));
     }
 
     // Start recovery of pending downloads
@@ -446,6 +461,7 @@ fn handle_event(
 fn register_with_server(
     cfg: &config::Config,
     caps: &capabilities::Capabilities,
+    live_cfg: Arc<RwLock<Config>>,
 ) -> anyhow::Result<()> {
     use reqwest::blocking::Client;
     use std::time::Duration;
@@ -453,7 +469,7 @@ fn register_with_server(
     let base = cfg.server_url.trim_end_matches('/');
     let id = &cfg.companion_id;
 
-    // Register
+    // Register — log errors instead of silently discarding
     let reg_url = format!("{}/companions/{}/register", base, id);
     let reg_body = serde_json::json!({
         "name": std::env::var("COMPUTERNAME")
@@ -466,17 +482,40 @@ fn register_with_server(
     if let Some(token) = &cfg.auth_token {
         req = req.bearer_auth(token);
     }
-    let _ = req.send(); // fire-and-forget; server may be offline
+    if let Err(e) = req.send() {
+        warn!("Failed to register with server: {}", e);
+    }
 
-    // Fetch pending config
+    // Fetch pending config and apply if present
     let cfg_url = format!("{}/companions/{}/config", base, id);
     let mut req = client.get(&cfg_url);
     if let Some(token) = &cfg.auth_token {
         req = req.bearer_auth(token);
     }
-    let _ = req.send();
+    match req.send() {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(text) = r.text() {
+                if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if !cfg_json.is_null() {
+                        if let Ok(new_cfg) =
+                            serde_json::from_value::<crate::config::Config>(cfg_json)
+                        {
+                            let mut live = live_cfg.write().unwrap();
+                            let id = live.companion_id.clone();
+                            *live = new_cfg;
+                            live.companion_id = id;
+                            let _ = live.save();
+                            info!("Applied pending config from server");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(_) => {} // non-2xx: server may not have pending config, that is fine
+        Err(e) => warn!("Failed to fetch pending config: {}", e),
+    }
 
-    // Report capabilities
+    // Report capabilities — log errors instead of silently discarding
     let caps_url = format!("{}/companions/{}/capabilities", base, id);
     let caps_body = serde_json::json!({
         "encoders": caps.encoders,
@@ -488,7 +527,9 @@ fn register_with_server(
     if let Some(token) = &cfg.auth_token {
         req = req.bearer_auth(token);
     }
-    let _ = req.send();
+    if let Err(e) = req.send() {
+        warn!("Failed to report capabilities to server: {}", e);
+    }
 
     Ok(())
 }

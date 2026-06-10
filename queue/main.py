@@ -85,7 +85,9 @@ def _kpop_color(name: str) -> str:
 _live: dict = {}
 _workers: dict = {}
 _ws_connections: dict = {}  # companion_id -> {"ws": WebSocket, "kind": str, "name": str}
-_ws_lock = threading.Lock()
+_ws_lock = threading.Lock()        # used by sync helpers (_ws_push, list_companions, etc.)
+_ws_async_lock = None              # asyncio.Lock initialized lazily in ws_endpoint
+_queue_plan_lock = threading.Lock()  # guards _build_queue_plan DELETE+INSERT atomicity
 
 def _worker_update(name: str, status: str, job_id: str = None, filename: str = None):
     _workers[name] = {"last_seen": time.time(), "status": status,
@@ -360,6 +362,10 @@ def init_companion_registry(conn):
             enabled INTEGER NOT NULL DEFAULT 1
         )
     """)
+    try:
+        conn.execute("ALTER TABLE companion_registry ADD COLUMN weight INTEGER DEFAULT 5")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
 
 def init_file_pool(conn):
@@ -2084,9 +2090,12 @@ def _run_verification(job_id: str, output_path: str, source_duration: float, sou
             checks.append({"name": name, "pass": passed, "detail": detail,
                             **({"score": score} if score is not None else {})})
 
+        with db() as conn:
+            _jrow = conn.execute("SELECT output_codec FROM jobs WHERE id=?", (job_id,)).fetchone()
+        expected_codec = ((_jrow["output_codec"] if _jrow else None) or "av1").lower()
         codec = out_meta.get("video_codec", "")
-        chk("codec", codec == "av1", f"got {codec!r}, expected 'av1'")
-        if codec != "av1":
+        chk("codec", codec == expected_codec, f"got {codec!r}, expected {expected_codec!r}")
+        if codec != expected_codec:
             overall = "fail"
 
         out_dur   = out_meta.get("duration", 0.0)
@@ -2443,9 +2452,10 @@ def rescan_job(job_id: str):
                 checks.append({"name": name, "pass": passed, "detail": detail,
                                 **({"score": score} if score is not None else {})})
 
+            _exp_codec = (job.get("output_codec") or "av1").lower()
             codec = out_meta.get("video_codec", "")
-            chk("codec", codec == "av1", f"got {codec!r}, expected 'av1'")
-            if codec != "av1":
+            chk("codec", codec == _exp_codec, f"got {codec!r}, expected {_exp_codec!r}")
+            if codec != _exp_codec:
                 overall = "fail"
 
             out_dur  = out_meta.get("duration", 0.0)
@@ -2544,9 +2554,10 @@ def bulk_rescan(req: BulkRescanReq):
                 def chk(name, passed, detail, score=None):
                     checks.append({"name": name, "pass": passed, "detail": detail,
                                    **({"score": score} if score is not None else {})})
+                _exp_codec2 = (job.get("output_codec") or "av1").lower()
                 codec = out_meta.get("video_codec", "")
-                chk("codec", codec == "av1", f"got {codec!r}, expected 'av1'")
-                if codec != "av1": overall = "fail"
+                chk("codec", codec == _exp_codec2, f"got {codec!r}, expected {_exp_codec2!r}")
+                if codec != _exp_codec2: overall = "fail"
                 out_dur = out_meta.get("duration", 0.0)
                 dur_diff = abs(out_dur - src_duration)
                 chk("duration", dur_diff <= 2.0,
@@ -2699,7 +2710,8 @@ class UploadSession:
         }))
 
     def write_chunk(self, start: int, data: bytes) -> int:
-        with open(self.data_path, "r+b") as f:
+        mode = "r+b" if self.data_path.exists() else "wb"
+        with open(self.data_path, mode) as f:
             f.seek(start)
             f.write(data)
         self.received += len(data)
@@ -2923,6 +2935,7 @@ def download_output(job_id: str, request: Request):
 # ── SHA-256 cache ───────────────────────────────────────────────────────────────
 
 _sha256_cache: dict[str, str] = {}
+_MAX_SHA256_CACHE = 2000
 
 def _cached_sha256(path: Path) -> str:
     key = str(path)
@@ -2932,6 +2945,12 @@ def _cached_sha256(path: Path) -> str:
         return cached
     try:
         h = sha256_file(str(path))
+        # Evict half the cache when over the limit (each entry uses 2 keys: value + :mtime)
+        if len(_sha256_cache) > _MAX_SHA256_CACHE:
+            keys = [k for k in list(_sha256_cache.keys()) if not k.endswith(":mtime")]
+            for k in keys[:_MAX_SHA256_CACHE // 4]:
+                _sha256_cache.pop(k, None)
+                _sha256_cache.pop(f"{k}:mtime", None)
         _sha256_cache[key] = h
         _sha256_cache[f"{key}:mtime"] = str(mtime)
         return h
@@ -4535,7 +4554,12 @@ function renderNodeCard(c) {{
   const dotCls = c.online ? 'online' : 'offline';
   const dotTitle = c.online ? 'online' : 'offline';
   const caps = c.capabilities || {{}};
-  const encoders = caps.encoders || [];
+  const rawEncoders = caps.encoders;
+  const encoders = Array.isArray(rawEncoders)
+    ? rawEncoders
+    : (rawEncoders && typeof rawEncoders === 'object'
+        ? Object.values(rawEncoders).filter(v => v)
+        : []);
   const encBadges = encoders.map(e =>
     `<span class="node-badge node-badge-enc">${{esc(e)}}</span>`
   ).join('');
@@ -4856,6 +4880,10 @@ def build_queue_plan_endpoint(req: BuildQueueReq = None):
 
 def _build_queue_plan(req=None):
     """Build queue_plan from file_pool with weighted fair mixing."""
+    with _queue_plan_lock:
+        return _build_queue_plan_locked(req)
+
+def _build_queue_plan_locked(req=None):
     min_size = (req.min_size_mb if req and req.min_size_mb is not None
                 else int(_get_setting("min_size_mb", "0"))) * 1_000_000
     min_height = (req.min_height if req and req.min_height is not None
@@ -4896,9 +4924,9 @@ def _build_queue_plan(req=None):
         if not filtered:
             return 0
 
-        # Get companion weights from client table (by companion name) or default 5
-        weight_rows = conn.execute("SELECT name, weight FROM clients").fetchall()
-        weights_by_name = {r["name"]: max(1, r["weight"] or 5) for r in weight_rows}
+        # Get companion weights keyed by companion UUID from companion_registry
+        weight_rows = conn.execute("SELECT id, COALESCE(weight, 5) as weight FROM companion_registry").fetchall()
+        weights_by_id = {r["id"]: max(1, r["weight"] or 5) for r in weight_rows}
 
         # Group by companion_id
         by_companion: dict = {}
@@ -4907,7 +4935,7 @@ def _build_queue_plan(req=None):
             if cid not in by_companion:
                 cconn = conn.execute("SELECT name FROM companion_registry WHERE id=?", (cid,)).fetchone()
                 cname = cconn["name"] if cconn else cid[:8]
-                by_companion[cid] = {"name": cname, "files": [], "weight": weights_by_name.get(cname, 5)}
+                by_companion[cid] = {"name": cname, "files": [], "weight": weights_by_id.get(cid, 5)}
             by_companion[cid]["files"].append(r)
 
         # Weighted round-robin interleave
@@ -4966,6 +4994,7 @@ def _ws_push(cid: str, message: dict):
 
 @app.websocket("/ws/{kind}/{cid}")
 async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
+    global _ws_async_lock
     # Auth check
     if AUTH_ENABLED:
         expected = AUTH_COMPANION_TOKEN if kind == "companion" else AUTH_WORKER_TOKEN
@@ -4973,22 +5002,31 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
             await ws.close(code=4401)
             return
 
+    # Always require companion to be registered (even when AUTH_ENABLED=False)
+    with db() as conn:
+        _reg_row = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+    if not _reg_row:
+        await ws.close(code=4401, reason="unregistered companion")
+        return
+
     await ws.accept()
 
-    # Register connection
-    with _ws_lock:
+    # Initialize async lock lazily (must be done inside event loop)
+    if _ws_async_lock is None:
+        _ws_async_lock = asyncio.Lock()
+
+    # Register connection (use async lock to avoid blocking event loop)
+    async with _ws_async_lock:
         _ws_connections[cid] = {"ws": ws, "kind": kind, "name": cid}
 
     now = time.time()
 
-    # Fetch and send pending config
+    # Fetch and send pending config (do NOT clear yet — wait for config_ack)
     pending_cfg = None
     with db() as conn:
         row = conn.execute("SELECT pending_config FROM companion_registry WHERE id=?", (cid,)).fetchone()
         if row and row["pending_config"]:
             pending_cfg = json.loads(row["pending_config"])
-            conn.execute("UPDATE companion_registry SET pending_config=NULL, last_seen=? WHERE id=?", (now, cid))
-            conn.commit()
 
     ctrl = _control.get("command", "run")
     await ws.send_json({"type": "welcome", "pending_config": pending_cfg, "control": ctrl})
@@ -5004,7 +5042,7 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
                 platform = data.get("platform", "")
                 version = data.get("version", "")
                 caps = data.get("capabilities", {})
-                with _ws_lock:
+                async with _ws_async_lock:
                     _ws_connections[cid]["name"] = name
                 with db() as conn:
                     existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
@@ -5026,25 +5064,39 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
                 files = data.get("files", [])
                 with db() as conn:
                     for f in files:
-                        fp_id = str(uuid.uuid4())
+                        fpath = f.get("path", "")
                         try:
+                            # INSERT OR IGNORE preserves existing id (and queue_plan refs)
                             conn.execute("""
-                                INSERT OR REPLACE INTO file_pool
+                                INSERT OR IGNORE INTO file_pool
                                 (id, companion_id, file_path, size, codec, duration,
                                  width, height, fps, bitrate, discovered_at, status)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,
-                                    COALESCE((SELECT status FROM file_pool WHERE companion_id=? AND file_path=?), 'pending'))
-                            """, (fp_id, cid, f.get("path", ""), f.get("size", 0),
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')
+                            """, (str(uuid.uuid4()), cid, fpath, f.get("size", 0),
                                   f.get("codec", ""), f.get("duration", 0.0),
                                   f.get("width", 0), f.get("height", 0),
                                   f.get("fps", 0.0), f.get("bitrate", 0),
-                                  now, cid, f.get("path", "")))
+                                  now))
+                            # Update mutable metadata for existing rows (preserves id)
+                            conn.execute("""
+                                UPDATE file_pool SET size=?, codec=?, duration=?,
+                                    width=?, height=?, fps=?, bitrate=?, discovered_at=?
+                                WHERE companion_id=? AND file_path=?
+                            """, (f.get("size", 0), f.get("codec", ""), f.get("duration", 0.0),
+                                  f.get("width", 0), f.get("height", 0),
+                                  f.get("fps", 0.0), f.get("bitrate", 0),
+                                  now, cid, fpath))
                         except Exception as e:
                             log.warning("file_pool insert error: %s", e)
                     conn.commit()
                 log.info("File list from %s: %d files", cid[:8], len(files))
                 # Auto-rebuild queue plan
                 threading.Thread(target=_build_queue_plan, daemon=True).start()
+
+            elif msg_type == "config_ack":
+                with db() as conn:
+                    conn.execute("UPDATE companion_registry SET pending_config=NULL WHERE id=?", (cid,))
+                    conn.commit()
 
             elif msg_type == "heartbeat":
                 await ws.send_json({"type": "pong"})
@@ -5083,7 +5135,7 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
                             (job_id,)
                         ).fetchone()
                         conn.execute(
-                            "UPDATE jobs SET status='done', output_size=?, updated_at=? WHERE id=?",
+                            "UPDATE jobs SET status='done', output_size=?, percent=100, updated_at=? WHERE id=?",
                             (output_size, now, job_id)
                         )
                         conn.commit()
@@ -5112,7 +5164,7 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
     except Exception as e:
         log.warning("WS error for %s: %s", cid[:8], e)
     finally:
-        with _ws_lock:
+        async with _ws_async_lock:
             _ws_connections.pop(cid, None)
         with db() as conn:
             conn.execute("UPDATE companion_registry SET last_seen=? WHERE id=?", (time.time(), cid))

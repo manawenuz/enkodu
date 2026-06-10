@@ -1,14 +1,17 @@
 use crate::capabilities::Capabilities;
 use crate::config::Config;
+use crate::core::submit;
 use crate::scan;
 use log::{info, warn};
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const RECONNECT_DELAY_SECS: u64 = 15;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const FILE_LIST_INTERVAL_SECS: u64 = 300; // re-send file list every 5 min
+/// If no pong is received within this many seconds, consider the connection dead.
+const PONG_TIMEOUT_SECS: u64 = 60;
 
 type WsStream = tungstenite::WebSocket<
     tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
@@ -76,12 +79,28 @@ fn ws_loop(live_cfg: Arc<RwLock<Config>>, caps: Capabilities) {
                     continue;
                 }
 
-                // Send initial file list
-                let cfg_snap = live_cfg.read().unwrap().clone();
-                send_file_list(&mut socket, &cfg_snap);
+                // FIX M6: collect file list in a background thread before the message
+                // loop so that a large scan does not block heartbeats. The scan result
+                // is stored in a shared slot; the message loop drains and sends it on
+                // the next heartbeat tick rather than blocking inline.
+                let pending_file_list: Arc<Mutex<Option<Vec<Value>>>> =
+                    Arc::new(Mutex::new(None));
+
+                {
+                    // Kick off the initial scan right away.
+                    let cfg_snap = live_cfg.read().unwrap().clone();
+                    let slot = Arc::clone(&pending_file_list);
+                    std::thread::spawn(move || {
+                        let entries = collect_file_list(&cfg_snap);
+                        *slot.lock().unwrap() = Some(entries);
+                    });
+                }
 
                 let mut last_heartbeat = Instant::now();
                 let mut last_file_list = Instant::now();
+
+                // FIX H8: track last pong to detect dead TLS connections.
+                let mut last_pong = Instant::now();
 
                 // Set read timeout on the underlying TCP stream (Plain only; TLS
                 // streams don't expose set_read_timeout directly).
@@ -89,18 +108,36 @@ fn ws_loop(live_cfg: Arc<RwLock<Config>>, caps: Capabilities) {
 
                 // Message loop
                 loop {
-
                     match socket.read() {
                         Ok(tungstenite::Message::Text(text)) => {
                             let msg: Value = match serde_json::from_str(&text) {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
-                            handle_server_message(&msg, &live_cfg);
+
+                            // FIX H8: treat "pong" text messages as proof-of-life.
+                            if msg
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                == "pong"
+                            {
+                                last_pong = Instant::now();
+                            }
+
+                            handle_server_message(
+                                &msg,
+                                &live_cfg,
+                                &mut socket,
+                            );
                         }
                         Ok(tungstenite::Message::Ping(data)) => {
                             let _ =
                                 socket.send(tungstenite::Message::Pong(data));
+                        }
+                        // FIX H8: binary Pong frame also counts as proof-of-life.
+                        Ok(tungstenite::Message::Pong(_)) => {
+                            last_pong = Instant::now();
                         }
                         Ok(tungstenite::Message::Close(_)) => {
                             info!("WS server closed connection");
@@ -121,6 +158,17 @@ fn ws_loop(live_cfg: Arc<RwLock<Config>>, caps: Capabilities) {
 
                     // Heartbeat
                     if last_heartbeat.elapsed().as_secs() >= HEARTBEAT_INTERVAL_SECS {
+                        // FIX H8: check for dead connection before sending the next
+                        // heartbeat. Two missed heartbeat intervals without a pong
+                        // means the TLS connection is likely silently dead.
+                        if last_pong.elapsed().as_secs() > PONG_TIMEOUT_SECS {
+                            warn!(
+                                "WS dead (no pong in {}s), reconnecting",
+                                PONG_TIMEOUT_SECS
+                            );
+                            break;
+                        }
+
                         let hb = json!({"type": "heartbeat"});
                         if socket
                             .send(tungstenite::Message::Text(hb.to_string()))
@@ -131,11 +179,23 @@ fn ws_loop(live_cfg: Arc<RwLock<Config>>, caps: Capabilities) {
                         last_heartbeat = Instant::now();
                     }
 
-                    // Periodic file list refresh
+                    // FIX M6: flush any pending file list collected by the background
+                    // thread, or trigger a new background scan on the refresh interval.
                     if last_file_list.elapsed().as_secs() >= FILE_LIST_INTERVAL_SECS {
                         let cfg_snap = live_cfg.read().unwrap().clone();
-                        send_file_list(&mut socket, &cfg_snap);
+                        let slot = Arc::clone(&pending_file_list);
+                        std::thread::spawn(move || {
+                            let entries = collect_file_list(&cfg_snap);
+                            *slot.lock().unwrap() = Some(entries);
+                        });
                         last_file_list = Instant::now();
+                    }
+
+                    // Send file list if the background thread has produced one.
+                    if let Ok(mut guard) = pending_file_list.try_lock() {
+                        if let Some(entries) = guard.take() {
+                            send_file_list(&mut socket, &entries);
+                        }
                     }
                 }
 
@@ -166,14 +226,15 @@ fn set_stream_read_timeout(
             let _ = tcp.set_read_timeout(Some(timeout));
         }
         // For TLS streams there's no direct way to set read timeout; rely on
-        // the heartbeat interval to detect dead connections.
+        // the pong-timeout heartbeat mechanism to detect dead connections.
         _ => {}
     }
 }
 
-fn send_file_list(socket: &mut WsStream, cfg: &Config) {
+/// FIX M6: pure scan — no socket I/O.
+fn collect_file_list(cfg: &Config) -> Vec<Value> {
     let files = scan::scan(cfg);
-    let file_entries: Vec<Value> = files
+    files
         .iter()
         .map(|f| {
             json!({
@@ -187,8 +248,11 @@ fn send_file_list(socket: &mut WsStream, cfg: &Config) {
                 "bitrate": 0
             })
         })
-        .collect();
+        .collect()
+}
 
+/// FIX M6: write-only — accepts pre-collected entries.
+fn send_file_list(socket: &mut WsStream, file_entries: &[Value]) {
     let msg = json!({
         "type": "file_list",
         "files": file_entries
@@ -201,7 +265,11 @@ fn send_file_list(socket: &mut WsStream, cfg: &Config) {
     }
 }
 
-fn handle_server_message(msg: &Value, live_cfg: &Arc<RwLock<Config>>) {
+fn handle_server_message(
+    msg: &Value,
+    live_cfg: &Arc<RwLock<Config>>,
+    socket: &mut WsStream,
+) {
     let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match msg_type {
@@ -211,12 +279,16 @@ fn handle_server_message(msg: &Value, live_cfg: &Arc<RwLock<Config>>) {
             {
                 info!("Received pending config from server");
                 apply_server_config(pending_cfg, live_cfg);
+                // FIX H4: acknowledge so the server clears pending_config from DB.
+                send_config_ack(socket);
             }
         }
         "config_update" => {
             if let Some(cfg_val) = msg.get("config") {
                 info!("Received config update from server");
                 apply_server_config(cfg_val, live_cfg);
+                // FIX H4: acknowledge so the server clears pending_config from DB.
+                send_config_ack(socket);
             }
         }
         "assign_upload" => {
@@ -224,23 +296,31 @@ fn handle_server_message(msg: &Value, live_cfg: &Arc<RwLock<Config>>) {
                 .get("job_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // The server may send the field as "path" or "file_path".
             let file_path = msg
-                .get("file_path")
+                .get("path")
+                .or_else(|| msg.get("file_path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+
+            if job_id.is_empty() || file_path.is_empty() {
+                warn!(
+                    "assign_upload: missing job_id or path in message: {}",
+                    msg
+                );
+                return;
+            }
+
             info!(
                 "Received upload assignment: job={} file={}",
                 job_id, file_path
             );
-            let job_id = job_id.to_string();
-            let file_path = file_path.to_string();
+
+            // FIX H7: actually trigger the upload on a background thread.
+            let cfg_snap = live_cfg.read().unwrap().clone();
+            let path = std::path::PathBuf::from(file_path);
             std::thread::spawn(move || {
-                // TODO: wire into submit::submit_bg for direct assignment support
-                log::info!(
-                    "Upload assignment received: job={} path={}",
-                    job_id,
-                    file_path
-                );
+                submit::submit_bg(cfg_snap, path);
             });
         }
         "control" => {
@@ -250,8 +330,18 @@ fn handle_server_message(msg: &Value, live_cfg: &Arc<RwLock<Config>>) {
                 .unwrap_or("run");
             info!("WS control: {}", cmd);
         }
-        "pong" => {}
+        "pong" => {
+            // Already handled in the message loop for last_pong tracking.
+        }
         _ => {}
+    }
+}
+
+/// FIX H4: send a config_ack so the server knows to clear pending_config.
+fn send_config_ack(socket: &mut WsStream) {
+    let ack = serde_json::json!({"type": "config_ack"}).to_string();
+    if let Err(e) = socket.send(tungstenite::Message::Text(ack)) {
+        warn!("Failed to send config_ack: {}", e);
     }
 }
 
