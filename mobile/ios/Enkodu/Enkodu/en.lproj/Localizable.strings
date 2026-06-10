@@ -1,0 +1,53 @@
+/* Home Screen */
+"checking_capability" = "Checking device capability…";
+"av1_not_supported_title" = "AV1 Not Supported";
+"av1_not_supported_message" = "This device cannot play AV1 efficiently. The upgrade flow is disabled.";
+"av1_not_supported_secondary" = "Queue status and monitoring are still available.";
+"ready_to_upgrade" = "Ready to upgrade videos";
+"select_video" = "Select Video";
+"view_queue" = "View Queue";
+"settings" = "Settings";
+
+/* Settings */
+"server_url_hint" = "Server URL (https://…)";
+"display_name_hint" = "Display Name (optional)";
+"test_connection" = "Test Connection";
+"testing" = "Testing…";
+"server_reachable" = "✓ Server reachable";
+"server_unreachable" = "✗ Server unreachable";
+"network" = "Network";
+"wifi_only_uploads" = "WiFi-only uploads";
+"wifi_only_downloads" = "WiFi-only downloads";
+"max_upload_size" = "Max upload size on cellular: %d MB";
+"battery" = "Battery";
+"min_battery" = "Minimum battery: %d%%";
+"save" = "Save";
+"cancel" = "Cancel";
+"done" = "Done";
+"settings_saved" = "Settings saved";
+"invalid_url" = "Please enter a valid server URL";
+"cannot_reach_server" = "Cannot reach server. Check your URL and network.";
+
+/* Transfer */
+"uploading" = "Uploading…";
+"downloading" = "Downloading…";
+"transfer_complete" = "Transfer Complete";
+"transfer_failed" = "Transfer Failed";
+"retry" = "Retry";
+"dismiss" = "Dismiss";
+
+/* Errors */
+"error_server_unreachable" = "Cannot reach the Enkodu server. Check your network connection and server URL in settings.";
+"error_upload_failed" = "Upload failed after multiple retries. The server may be busy or your network connection is unstable.";
+"error_download_failed" = "Download failed. Please check your connection and try again.";
+"error_checksum_mismatch" = "The downloaded file appears corrupted. It has been removed for your safety.";
+"error_network_unavailable" = "No network connection available. Please connect to WiFi or enable cellular data.";
+"error_battery_low" = "Battery too low for transfers. Please charge your device and try again.";
+"error_disk_full" = "Not enough storage space. Please free up space and try again.";
+"error_av1_not_supported" = "This device cannot play AV1 videos efficiently. The upgrade feature is disabled.";
+
+/* Notifications */
+"notification_upload_complete" = "Upload complete";
+"notification_download_complete" = "Download complete";
+"notification_upload_failed" = "Upload failed";
+"notification_download_failed" = "Download failed";

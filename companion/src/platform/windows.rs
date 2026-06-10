@@ -1,62 +1,71 @@
 //! Windows-specific platform adapter.
 //!
 //! Provides Windows implementations for notifications, paths, autostart, and IPC.
-//!
-//! Note: For a production Windows build, you'll need to:
-//! 1. Add `winreg` crate for proper registry autostart
-//! 2. Add `named_pipe` crate for proper named pipe IPC
-//! 3. Add `windows-rs` or `winrt-notification` for proper toast notifications
-//!
-//! This implementation provides working stubs using cross-platform approaches
-//! where possible, with notes on what needs to be enhanced for native Windows.
 
 use anyhow::{Context, Result};
 use log::{info, warn};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use crate::config::Config;
+use crate::core::commands;
 use crate::core::ServerState;
 use crate::platform::{Platform, SingleInstanceGuard};
 
 /// Windows platform implementation.
 pub struct WindowsPlatform;
 
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "EnkoduCompanion";
+const IPC_HOST: &str = "127.0.0.1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WindowsIpcMetadata {
+    port: u16,
+    auth_token: String,
+    pid: u32,
+}
+
 impl WindowsPlatform {
-    /// Show a Windows notification.
-    /// Uses a simple message box as fallback (works without dependencies).
-    /// TODO: Replace with proper toast notification using winrt-notification crate.
+    /// Show a Windows 10+ toast notification via PowerShell WinRT bindings.
+    /// Non-blocking: spawns PowerShell and returns immediately.
     fn show_notification(title: &str, body: &str) {
         info!("[notify] {}: {}", title, body);
-        
-        // Try PowerShell toast notification first (Windows 10+)
+
+        let title_esc = title.replace('\'', "\\'");
+        let body_esc = body.replace('\'', "\\'");
+        // Use Windows.UI.Notifications WinRT toast — works on Windows 10+ without extra modules.
+        // 'Windows PowerShell' is a registered AUMID usable as notifier fallback.
         let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; \
-             [System.Windows.Forms.MessageBox]::Show('{}', '{}', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)",
-            body.replace("'", "''"),
-            title.replace("'", "''")
+            "$null=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]; \
+             $t=[Windows.UI.Notifications.ToastTemplateType]::ToastText02; \
+             $x=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($t); \
+             $e=$x.GetElementsByTagName('text'); \
+             $null=$e[0].AppendChild($x.CreateTextNode('{title}')); \
+             $null=$e[1].AppendChild($x.CreateTextNode('{body}')); \
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Windows PowerShell').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+            title = title_esc,
+            body = body_esc,
         );
-        
-        // Use a quick timeout to avoid blocking
-        let status = Command::new("powershell")
-            .arg("-Command")
-            .arg(&script)
-            .arg("-WindowStyle")
-            .arg("Hidden")
-            .status();
-        
-        if let Err(e) = status {
-            warn!("PowerShell notification failed, trying simpler approach: {}", e);
-            // Even simpler: just log it - the message box approach might be too intrusive
+
+        if let Err(e) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+            .spawn()
+        {
+            warn!("Toast notification spawn failed: {}", e);
         }
     }
 
-    /// Get the autostart flag file path.
-    /// TODO: Use registry HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
-    fn autostart_file() -> PathBuf {
+    /// Legacy autostart flag file path from the placeholder implementation.
+    fn legacy_autostart_flag() -> PathBuf {
         if let Some(appdata) = std::env::var_os("APPDATA") {
             PathBuf::from(appdata).join("Enkodu").join("autostart.flag")
         } else {
@@ -64,18 +73,134 @@ impl WindowsPlatform {
         }
     }
 
-    /// Set registry autostart.
-    /// TODO: Use winreg crate for proper registry manipulation.
-    fn set_registry_autostart(_exe_path: &PathBuf) -> Result<()> {
-        // Stub - requires winreg crate for full implementation
-        warn!("Registry autostart not implemented - install requires winreg crate");
+    fn state_dir_path() -> PathBuf {
+        std::env::var("LOCALAPPDATA")
+            .map(|p| PathBuf::from(p).join("Enkodu"))
+            .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\Enkodu"))
+    }
+
+    fn ipc_metadata_path() -> PathBuf {
+        Self::state_dir_path().join("ipc.json")
+    }
+
+    fn generate_auth_token() -> String {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    fn write_ipc_metadata(path: &Path, metadata: &WindowsIpcMetadata) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let body = serde_json::to_vec(metadata).context("serialize Windows IPC metadata")?;
+        fs::write(path, body).with_context(|| format!("write {}", path.display()))
+    }
+
+    fn load_ipc_metadata() -> Result<WindowsIpcMetadata> {
+        let path = Self::ipc_metadata_path();
+        let body = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_slice(&body).context("parse Windows IPC metadata")
+    }
+
+    fn quoted_exe(exe_path: &Path) -> String {
+        format!("\"{}\"", exe_path.display())
+    }
+
+    fn registry_autostart_enabled() -> bool {
+        Command::new("reg")
+            .args(["query", RUN_KEY, "/v", RUN_VALUE])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn set_registry_autostart(exe_path: &Path) -> Result<()> {
+        let value = Self::quoted_exe(exe_path);
+        let output = Command::new("reg")
+            .args([
+                "add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &value, "/f",
+            ])
+            .output()
+            .context("run reg add for autostart")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "reg add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         Ok(())
     }
 
-    /// Clear registry autostart.
     fn clear_registry_autostart() -> Result<()> {
-        // Stub
+        if !Self::registry_autostart_enabled() {
+            return Ok(());
+        }
+
+        let output = Command::new("reg")
+            .args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"])
+            .output()
+            .context("run reg delete for autostart")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "reg delete failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
         Ok(())
+    }
+
+    fn handle_ipc_client(
+        mut stream: TcpStream,
+        expected_token: &str,
+        cfg: &Config,
+        state: &Arc<std::sync::RwLock<ServerState>>,
+    ) {
+        let mut auth_line = String::new();
+        let mut cmd_line = String::new();
+
+        let response = match stream.try_clone() {
+            Ok(cloned) => {
+                let mut reader = BufReader::new(cloned);
+                match reader.read_line(&mut auth_line) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Windows IPC auth read failed: {}", e);
+                        return;
+                    }
+                }
+                match reader.read_line(&mut cmd_line) {
+                    Ok(0) => "err: missing command".to_string(),
+                    Ok(_) => {
+                        let auth = auth_line.trim_end();
+                        let cmd = cmd_line.trim_end();
+                        if auth != expected_token {
+                            "err: unauthorized".to_string()
+                        } else {
+                            info!("Windows IPC: received command '{}'", cmd);
+                            commands::dispatch(cmd, cfg, state)
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Windows IPC command read failed: {}", e);
+                        "err: failed to read command".to_string()
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Windows IPC stream clone failed: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = stream.write_all(format!("{}\n", response).as_bytes()) {
+            warn!("Windows IPC write failed: {}", e);
+        }
     }
 }
 
@@ -107,37 +232,33 @@ impl Platform for WindowsPlatform {
     }
 
     fn autostart_enabled(&self) -> bool {
-        WindowsPlatform::autostart_file().exists()
+        WindowsPlatform::registry_autostart_enabled()
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<()> {
-        let autostart_path = WindowsPlatform::autostart_file();
-        
         if enabled {
             let exe = std::env::current_exe()
                 .unwrap_or_else(|_| PathBuf::from("C:\\Program Files\\Enkodu\\enkodu.exe"));
-            
-            let autostart_dir = autostart_path.parent().unwrap();
-            fs::create_dir_all(autostart_dir)?;
-            
-            fs::write(&autostart_path, exe.to_string_lossy().as_ref())?;
-            info!("Autostart enabled — flag file written to {}", autostart_path.display());
-            
-            // Also try registry (non-fatal if it fails)
-            if let Err(e) = WindowsPlatform::set_registry_autostart(&exe) {
-                warn!("Could not set registry autostart: {}", e);
-            }
+            WindowsPlatform::set_registry_autostart(&exe)?;
+            info!("Autostart enabled via HKCU Run for {}", exe.display());
         } else {
-            if autostart_path.exists() {
-                fs::remove_file(&autostart_path)?;
-                info!("Autostart disabled — flag file removed");
-            }
-            
-            if let Err(e) = WindowsPlatform::clear_registry_autostart() {
-                warn!("Could not clear registry autostart: {}", e);
+            WindowsPlatform::clear_registry_autostart()?;
+            info!("Autostart disabled via HKCU Run");
+        }
+
+        let legacy_flag = WindowsPlatform::legacy_autostart_flag();
+        if legacy_flag.exists() {
+            if let Err(e) = fs::remove_file(&legacy_flag) {
+                warn!(
+                    "Could not remove legacy autostart flag {}: {}",
+                    legacy_flag.display(),
+                    e
+                );
+            } else {
+                info!("Removed legacy autostart flag {}", legacy_flag.display());
             }
         }
-        
+
         Ok(())
     }
 
@@ -158,23 +279,77 @@ impl Platform for WindowsPlatform {
     }
 
     fn start_ipc_server(&self, cfg: Config, state: Arc<std::sync::RwLock<ServerState>>) {
-        // For Windows, we'll use a simple approach:
-        // Since we can't easily do cross-process IPC without named pipes,
-        // and named_pipe crate is not added yet, we'll use a no-op for now.
-        // The CLI will handle commands directly without IPC.
-        // TODO: Implement proper named pipe IPC server
-        info!("Windows IPC server: using direct execution mode (no background server)");
+        let listener = match TcpListener::bind((IPC_HOST, 0)) {
+            Ok(listener) => listener,
+            Err(e) => {
+                warn!("Windows IPC: cannot bind {}: {}", IPC_HOST, e);
+                return;
+            }
+        };
+
+        let port = match listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                warn!("Windows IPC: cannot read bound address: {}", e);
+                return;
+            }
+        };
+
+        let metadata = WindowsIpcMetadata {
+            port,
+            auth_token: WindowsPlatform::generate_auth_token(),
+            pid: std::process::id(),
+        };
+        let metadata_path = WindowsPlatform::ipc_metadata_path();
+        if let Err(e) = WindowsPlatform::write_ipc_metadata(&metadata_path, &metadata) {
+            warn!(
+                "Windows IPC: cannot write {}: {}",
+                metadata_path.display(),
+                e
+            );
+            return;
+        }
+
+        info!(
+            "Windows IPC: listening on {}:{} (metadata {})",
+            IPC_HOST,
+            port,
+            metadata_path.display()
+        );
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let cfg2 = cfg.clone();
+                        let state2 = Arc::clone(&state);
+                        let token = metadata.auth_token.clone();
+                        thread::spawn(move || {
+                            WindowsPlatform::handle_ipc_client(stream, &token, &cfg2, &state2);
+                        });
+                    }
+                    Err(e) => warn!("Windows IPC accept error: {}", e),
+                }
+            }
+        });
     }
 
     fn send_ipc_command(&self, cmd: &str) -> Result<String> {
-        // For direct execution mode on Windows, we can't send to a running instance
-        // without named pipes. For now, return an error that suggests running
-        // the command directly.
-        // TODO: Implement proper named pipe IPC client
-        anyhow::bail!(
-            "Windows IPC not implemented yet. \
-             On Windows, please use direct CLI commands: enkodu {} <args>",
-            cmd
-        );
+        let metadata = WindowsPlatform::load_ipc_metadata()
+            .context("enkodu companion is not running (missing Windows IPC metadata)")?;
+        let addr = format!("{}:{}", IPC_HOST, metadata.port);
+        let socket_addr = addr
+            .parse()
+            .with_context(|| format!("parse Windows IPC address {}", addr))?;
+        let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(2))
+            .with_context(|| format!("connect to running companion at {}", addr))?;
+        stream
+            .write_all(format!("{}\n{}\n", metadata.auth_token, cmd).as_bytes())
+            .context("write Windows IPC command")?;
+        let mut response = String::new();
+        BufReader::new(stream)
+            .read_line(&mut response)
+            .context("read Windows IPC response")?;
+        Ok(response.trim().to_string())
     }
 }

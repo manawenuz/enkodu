@@ -3,6 +3,11 @@ companion/target/
 worker/target/
 *.exe
 
+# Mobile build artifacts
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+
 # Python
 __pycache__/
 *.py[cod]

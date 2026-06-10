@@ -3,15 +3,50 @@ Queue service — runs on TrueNAS via Docker Compose.
 Workers poll GET /jobs/next to claim work; results posted back via /jobs/{id}/done|failed.
 """
 
-import hashlib, json, os, sqlite3, threading, subprocess, uuid, time, logging
+import argparse, asyncio, hashlib, hmac, json, os, re, secrets, shutil, sqlite3, sys, threading, subprocess, uuid, time, logging
+import urllib.error as _uerr
 import urllib.request as _ureq
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import quote, unquote
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from urllib.parse import quote, unquote, urlparse
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 from typing import Optional
 from pydantic import BaseModel
+
+try:
+    from webauthn import (
+        generate_registration_options,
+        verify_registration_response,
+        generate_authentication_options,
+        verify_authentication_response,
+        options_to_json,
+    )
+    from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+    from webauthn.helpers.structs import (
+        AuthenticatorSelectionCriteria,
+        PublicKeyCredentialDescriptor,
+        PublicKeyCredentialType,
+        UserVerificationRequirement,
+    )
+except Exception:  # pragma: no cover - dependency absence is handled at runtime.
+    generate_registration_options = None
+    verify_registration_response = None
+    generate_authentication_options = None
+    verify_authentication_response = None
+    options_to_json = None
+    base64url_to_bytes = None
+    bytes_to_base64url = None
+    AuthenticatorSelectionCriteria = None
+    PublicKeyCredentialDescriptor = None
+    PublicKeyCredentialType = None
+    UserVerificationRequirement = None
+
+try:
+    from authlib.integrations.starlette_client import OAuth
+except Exception:  # pragma: no cover - Authentik is optional.
+    OAuth = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -49,6 +84,8 @@ def _kpop_color(name: str) -> str:
 
 _live: dict = {}
 _workers: dict = {}
+_ws_connections: dict = {}  # companion_id -> {"ws": WebSocket, "kind": str, "name": str}
+_ws_lock = threading.Lock()
 
 def _worker_update(name: str, status: str, job_id: str = None, filename: str = None):
     _workers[name] = {"last_seen": time.time(), "status": status,
@@ -83,6 +120,53 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 VIDEO_EXTS   = {".mp4", ".mkv", ".avi", ".mov", ".ts", ".m2ts", ".wmv"}
 FFPROBE      = os.getenv("FFPROBE", "ffprobe")
 STALL_TIMEOUT = int(os.getenv("STALL_TIMEOUT", "900"))
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+AUTH_ENABLED = _env_bool("AUTH_ENABLED", False)
+AUTH_PUBLIC_ORIGIN = os.getenv("AUTH_PUBLIC_ORIGIN", "").strip().rstrip("/")
+AUTH_RP_ID = os.getenv("AUTH_RP_ID", "").strip()
+AUTH_RP_NAME = os.getenv("AUTH_RP_NAME", "Enkodu").strip() or "Enkodu"
+AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "enkodu_session")
+AUTH_SESSION_SECRET = os.getenv("AUTH_SESSION_SECRET", "")
+AUTH_SESSION_TTL = int(os.getenv("AUTH_SESSION_TTL", "2592000"))
+AUTH_COOKIE_SECURE = _env_bool(
+    "AUTH_COOKIE_SECURE",
+    AUTH_PUBLIC_ORIGIN.startswith("https://") if AUTH_PUBLIC_ORIGIN else False,
+)
+AUTH_LEGACY_MACHINE_ACCESS = _env_bool("AUTH_LEGACY_MACHINE_ACCESS", True)
+AUTH_API_TOKEN = os.getenv("AUTH_API_TOKEN", "")
+AUTH_WORKER_TOKEN = os.getenv("AUTH_WORKER_TOKEN", "")
+AUTH_COMPANION_TOKEN = os.getenv("AUTH_COMPANION_TOKEN", "")
+
+AUTHENTIK_ENABLED = _env_bool("AUTHENTIK_ENABLED", False)
+AUTHENTIK_DISCOVERY_URL = os.getenv("AUTHENTIK_DISCOVERY_URL", "").strip()
+AUTHENTIK_CLIENT_ID = os.getenv("AUTHENTIK_CLIENT_ID", "").strip()
+AUTHENTIK_CLIENT_SECRET = os.getenv("AUTHENTIK_CLIENT_SECRET", "").strip()
+AUTHENTIK_ALLOWED_EMAIL_DOMAIN = os.getenv("AUTHENTIK_ALLOWED_EMAIL_DOMAIN", "").strip().lower()
+AUTHENTIK_AUTO_CREATE_USERS = _env_bool("AUTHENTIK_AUTO_CREATE_USERS", False)
+AUTHENTIK_DEFAULT_ROLE = os.getenv("AUTHENTIK_DEFAULT_ROLE", "operator").strip() or "operator"
+
+JELLYFIN_ENABLED = _env_bool("JELLYFIN_ENABLED", False)
+JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").strip().rstrip("/")
+JELLYFIN_CLIENT_NAME = os.getenv("JELLYFIN_CLIENT_NAME", "Enkodu").strip() or "Enkodu"
+JELLYFIN_DEVICE_NAME = os.getenv("JELLYFIN_DEVICE_NAME", "Enkodu Queue").strip() or "Enkodu Queue"
+JELLYFIN_DEVICE_ID = os.getenv("JELLYFIN_DEVICE_ID", "enkodu-queue").strip() or "enkodu-queue"
+JELLYFIN_APP_VERSION = os.getenv("JELLYFIN_APP_VERSION", "0.1.0").strip() or "0.1.0"
+JELLYFIN_ALLOW_EMPTY_PASSWORD = _env_bool("JELLYFIN_ALLOW_EMPTY_PASSWORD", False)
+JELLYFIN_REQUIRE_ADMIN = _env_bool("JELLYFIN_REQUIRE_ADMIN", False)
+JELLYFIN_ALLOWED_USERS = {
+    u.strip().lower()
+    for u in os.getenv("JELLYFIN_ALLOWED_USERS", "").split(",")
+    if u.strip()
+}
+JELLYFIN_AUTO_CREATE_USERS = _env_bool("JELLYFIN_AUTO_CREATE_USERS", False)
+JELLYFIN_AUTO_LINK_LOCAL_USERS = _env_bool("JELLYFIN_AUTO_LINK_LOCAL_USERS", True)
+JELLYFIN_DEFAULT_ROLE = os.getenv("JELLYFIN_DEFAULT_ROLE", "operator").strip() or "operator"
 
 _CONTROL_PATH = Path(DB_PATH).parent / "control.json"
 
@@ -155,6 +239,7 @@ def init_db(conn):
         "ADD COLUMN verify_checks TEXT",
         "ADD COLUMN client_name TEXT",
         "ADD COLUMN client_path TEXT",
+        "ADD COLUMN output_codec TEXT DEFAULT 'av1'",
     ]:
         try:
             conn.execute(f"ALTER TABLE jobs {col}")
@@ -193,6 +278,122 @@ def init_settings(conn):
         except sqlite3.OperationalError:
             pass
 
+def init_auth_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            display_name TEXT NOT NULL,
+            email TEXT UNIQUE,
+            role TEXT NOT NULL DEFAULT 'operator',
+            source TEXT NOT NULL DEFAULT 'local',
+            external_subject TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            last_login REAL
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_external_subject
+        ON auth_users(source, external_subject)
+        WHERE external_subject IS NOT NULL AND external_subject != ''
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_passkeys (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            credential_id TEXT UNIQUE NOT NULL,
+            credential_public_key BLOB NOT NULL,
+            sign_count INTEGER NOT NULL DEFAULT 0,
+            transports TEXT,
+            name TEXT,
+            created_at REAL NOT NULL,
+            last_used REAL,
+            FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_challenges (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            challenge TEXT,
+            token TEXT,
+            expires_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            consumed_at REAL,
+            FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_auth_challenges_token
+        ON auth_challenges(token, kind, consumed_at, expires_at)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            last_seen REAL NOT NULL,
+            user_agent TEXT,
+            ip TEXT,
+            FOREIGN KEY(user_id) REFERENCES auth_users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
+    conn.commit()
+
+def init_companion_registry(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS companion_registry (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            platform TEXT NOT NULL DEFAULT '',
+            version TEXT NOT NULL DEFAULT '',
+            first_seen REAL,
+            last_seen REAL,
+            pending_config TEXT,
+            capabilities TEXT,
+            is_worker INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    conn.commit()
+
+def init_file_pool(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS file_pool (
+            id TEXT PRIMARY KEY,
+            companion_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            codec TEXT NOT NULL DEFAULT '',
+            duration REAL NOT NULL DEFAULT 0,
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0,
+            fps REAL NOT NULL DEFAULT 0,
+            bitrate INTEGER NOT NULL DEFAULT 0,
+            discovered_at REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            UNIQUE(companion_id, file_path)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS queue_plan (
+            id TEXT PRIMARY KEY,
+            position INTEGER NOT NULL,
+            file_pool_id TEXT NOT NULL,
+            companion_id TEXT NOT NULL,
+            output_codec TEXT NOT NULL DEFAULT 'av1',
+            created_at REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            job_id TEXT
+        )
+    """)
+    conn.commit()
+
 def _get_setting(key: str, default: str = "") -> str:
     with db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -206,12 +407,459 @@ def _all_settings() -> dict:
 _db = db_connect()
 init_db(_db)
 init_settings(_db)
+init_auth_db(_db)
+init_companion_registry(_db)
+init_file_pool(_db)
 _db_lock = threading.Lock()
 
 @contextmanager
 def db():
     with _db_lock:
         yield _db
+
+# ── auth helpers ──────────────────────────────────────────────────────────────
+
+def _require_webauthn():
+    if not generate_registration_options:
+        raise HTTPException(
+            503,
+            "passkey support is not installed; rebuild with queue/requirements.txt",
+        )
+
+def _auth_public_origin(request: Request | None = None) -> str:
+    if AUTH_PUBLIC_ORIGIN:
+        return AUTH_PUBLIC_ORIGIN
+    if request is not None:
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+        proto = proto.split(",", 1)[0].strip()
+        host = (
+            request.headers.get("x-forwarded-host")
+            or request.headers.get("host")
+            or request.url.netloc
+            or "localhost:8090"
+        )
+        host = host.split(",", 1)[0].strip()
+        return f"{proto}://{host}".rstrip("/")
+    return "http://localhost:8090"
+
+def _auth_rp_id(request: Request | None = None) -> str:
+    if AUTH_RP_ID:
+        return AUTH_RP_ID
+    host = urlparse(_auth_public_origin(request)).hostname
+    return host or "localhost"
+
+def _expected_origins(request: Request | None = None) -> list[str]:
+    origins = []
+    for origin in (AUTH_PUBLIC_ORIGIN, _auth_public_origin(request)):
+        origin = (origin or "").rstrip("/")
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins or ["http://localhost:8090"]
+
+def _now() -> float:
+    return time.time()
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def _client_ip(request: Request) -> str:
+    return (
+        request.headers.get("X-Real-IP")
+        or (request.headers.get("X-Forwarded-For", "").split(",")[0])
+        or (request.client.host if request.client else "unknown")
+    ).strip()
+
+def _user_dict(row) -> dict | None:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "display_name": row["display_name"],
+        "email": row["email"],
+        "role": row["role"],
+        "source": row["source"],
+        "enabled": bool(row["enabled"]),
+        "last_login": row["last_login"],
+    }
+
+def _current_user(request: Request) -> dict | None:
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    if not token:
+        return None
+    token_hash = _hash_token(token)
+    now = _now()
+    with db() as conn:
+        row = conn.execute("""
+            SELECT u.*
+            FROM auth_sessions s
+            JOIN auth_users u ON u.id=s.user_id
+            WHERE s.token_hash=? AND s.expires_at>? AND u.enabled=1
+        """, (token_hash, now)).fetchone()
+        if not row:
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash=? OR expires_at<=?",
+                         (token_hash, now))
+            conn.commit()
+            return None
+        conn.execute("UPDATE auth_sessions SET last_seen=? WHERE token_hash=?",
+                     (now, token_hash))
+        conn.commit()
+    return _user_dict(row)
+
+def _set_session_cookie(response, user_id: str, request: Request):
+    token = secrets.token_urlsafe(48)
+    now = _now()
+    expires_at = now + AUTH_SESSION_TTL
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO auth_sessions
+                (token_hash, user_id, created_at, expires_at, last_seen, user_agent, ip)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            _hash_token(token), user_id, now, expires_at, now,
+            request.headers.get("user-agent", ""), _client_ip(request),
+        ))
+        conn.execute("UPDATE auth_users SET last_login=?, updated_at=? WHERE id=?",
+                     (now, now, user_id))
+        conn.commit()
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        token,
+        max_age=AUTH_SESSION_TTL,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+def _clear_session_cookie(response, request: Request):
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    if token:
+        with db() as conn:
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash=?", (_hash_token(token),))
+            conn.commit()
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+
+def _bearer_or_header_token(request: Request, *header_names: str) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    for name in header_names:
+        value = request.headers.get(name)
+        if value:
+            return value.strip()
+    return ""
+
+def _token_matches(got: str, expected: str) -> bool:
+    return bool(got and expected and hmac.compare_digest(got, expected))
+
+def _has_api_token(request: Request) -> bool:
+    got = _bearer_or_header_token(request, "X-Enkodu-Api-Token", "X-Enkodu-Token")
+    return _token_matches(got, AUTH_API_TOKEN)
+
+def _has_worker_token(request: Request) -> bool:
+    got = _bearer_or_header_token(request, "X-Enkodu-Worker-Token", "X-Enkodu-Token")
+    return _token_matches(got, AUTH_WORKER_TOKEN)
+
+def _has_companion_token(request: Request) -> bool:
+    got = _bearer_or_header_token(request, "X-Enkodu-Client-Token", "X-Enkodu-Companion-Token", "X-Enkodu-Token")
+    return _token_matches(got, AUTH_COMPANION_TOKEN)
+
+def _parts(path: str) -> list[str]:
+    return [p for p in path.strip("/").split("/") if p]
+
+def _is_public_auth_path(path: str) -> bool:
+    return path in ("/login", "/favicon.ico", "/api/myip") or path.startswith("/auth/")
+
+def _is_worker_endpoint(method: str, path: str) -> bool:
+    parts = _parts(path)
+    if method == "GET" and path in ("/jobs/next", "/control"):
+        return True
+    if method == "POST" and path == "/jobs/abandon":
+        return True
+    if method == "POST" and len(parts) == 3 and parts[0] == "workers" and parts[2] == "heartbeat":
+        return True
+    if len(parts) == 3 and parts[0] == "jobs":
+        action = parts[2]
+        if method == "GET" and action == "source":
+            return True
+        if method == "PUT" and action == "output":
+            return True
+        if method == "POST" and action in ("progress", "done", "failed"):
+            return True
+    return False
+
+def _is_companion_endpoint(method: str, path: str) -> bool:
+    parts = _parts(path)
+    if method == "GET" and path in ("/status", "/jobs/live", "/jobs", "/settings", "/control"):
+        return True
+    if method == "POST" and path == "/settings":
+        return True
+    if method == "POST" and len(parts) == 2 and parts[0] == "control":
+        return True
+    if method == "POST" and path == "/clients/queue-manifest":
+        return True
+    if method == "POST" and path == "/jobs/upload":
+        return True
+    if path.startswith("/jobs/upload/resumable/"):
+        return True
+    if len(parts) == 2 and parts[0] == "jobs" and method == "GET":
+        return True
+    if len(parts) == 3 and parts[0] == "jobs":
+        action = parts[2]
+        if method == "GET" and action in ("output", "checksum"):
+            return True
+        if method == "POST" and action == "set-path":
+            return True
+    if path.startswith("/companions/"):
+        return True
+    if path in ("/companions", "/file-pool", "/queue-plan"):
+        return True
+    if path.startswith("/file-pool/"):
+        return True
+    if path.startswith("/queue-plan/"):
+        return True
+    return False
+
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+def _required_role(method: str, path: str) -> str:
+    if method in ("GET", "HEAD"):
+        return "viewer"
+    parts = _parts(path)
+    if path in ("/settings", "/clients/weights", "/jobs/clear-pending", "/jobs/clear-failed"):
+        return "admin"
+    if path == "/jobs/bulk-delete-original":
+        return "admin"
+    if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "delete-original":
+        return "admin"
+    return "operator"
+
+def _user_has_role(user: dict, required: str) -> bool:
+    return _ROLE_RANK.get(user.get("role", "viewer"), 0) >= _ROLE_RANK.get(required, 0)
+
+def _auth_required_response(request: Request):
+    accepts_html = "text/html" in request.headers.get("accept", "")
+    if request.method in ("GET", "HEAD") and accepts_html:
+        next_url = quote(str(request.url.path))
+        return RedirectResponse(f"/login?next={next_url}", status_code=303)
+    return JSONResponse({"detail": "authentication required"}, status_code=401)
+
+def _auth_forbidden_response(detail: str = "forbidden"):
+    return JSONResponse({"detail": detail}, status_code=403)
+
+def _create_invite(conn, user_id: str, ttl_secs: int = 86400) -> str:
+    token = secrets.token_urlsafe(32)
+    now = _now()
+    conn.execute("""
+        INSERT INTO auth_challenges
+            (id, user_id, kind, challenge, token, expires_at, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (str(uuid.uuid4()), user_id, "invite", None, token, now + ttl_secs, now))
+    conn.commit()
+    return token
+
+def _lookup_invite(conn, token: str):
+    return conn.execute("""
+        SELECT c.*, u.username, u.display_name, u.enabled
+        FROM auth_challenges c
+        JOIN auth_users u ON u.id=c.user_id
+        WHERE c.kind='invite' AND c.token=? AND c.consumed_at IS NULL AND c.expires_at>?
+    """, (token, _now())).fetchone()
+
+def _store_challenge(conn, user_id: str, kind: str, challenge: str, token: str | None = None,
+                     ttl_secs: int = 300) -> str:
+    challenge_id = str(uuid.uuid4())
+    now = _now()
+    conn.execute("""
+        INSERT INTO auth_challenges
+            (id, user_id, kind, challenge, token, expires_at, created_at)
+        VALUES (?,?,?,?,?,?,?)
+    """, (challenge_id, user_id, kind, challenge, token, now + ttl_secs, now))
+    conn.commit()
+    return challenge_id
+
+def _consume_challenge(conn, challenge_id: str):
+    conn.execute("UPDATE auth_challenges SET consumed_at=? WHERE id=?",
+                 (_now(), challenge_id))
+
+def _setup_url(token: str) -> str:
+    return f"{_auth_public_origin()}/auth/setup?token={quote(token)}"
+
+class PasskeyRegisterOptionsReq(BaseModel):
+    token: str
+
+class PasskeyRegisterVerifyReq(BaseModel):
+    token: str
+    credential: dict
+    name: str | None = None
+
+class PasskeyLoginOptionsReq(BaseModel):
+    username: str
+
+class PasskeyLoginVerifyReq(BaseModel):
+    challenge_id: str
+    credential: dict
+
+class JellyfinLoginReq(BaseModel):
+    username: str
+    password: str = ""
+    next: str = "/"
+
+def _safe_next_url(next_url: str | None) -> str:
+    next_url = (next_url or "/").strip()
+    if not next_url.startswith("/") or next_url.startswith("//"):
+        return "/"
+    return next_url
+
+def _jellyfin_auth_value(token: str = "") -> str:
+    def esc(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    parts = [
+        f'Client="{esc(JELLYFIN_CLIENT_NAME)}"',
+        f'Device="{esc(JELLYFIN_DEVICE_NAME)}"',
+        f'DeviceId="{esc(JELLYFIN_DEVICE_ID)}"',
+        f'Version="{esc(JELLYFIN_APP_VERSION)}"',
+    ]
+    if token:
+        parts.append(f'Token="{esc(token)}"')
+    return "MediaBrowser " + ", ".join(parts)
+
+def _jellyfin_headers(token: str = "") -> dict:
+    auth_value = _jellyfin_auth_value(token)
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": auth_value,
+        "X-Emby-Authorization": auth_value,
+    }
+
+def _jellyfin_post(path: str, payload: dict | None = None, token: str = "") -> dict:
+    if not JELLYFIN_URL:
+        raise HTTPException(503, "Jellyfin auth is enabled but JELLYFIN_URL is not configured")
+    url = f"{JELLYFIN_URL}/{path.lstrip('/')}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = _ureq.Request(url, data=data, headers=_jellyfin_headers(token), method="POST")
+    try:
+        with _ureq.urlopen(req, timeout=10) as response:
+            raw = response.read()
+    except _uerr.HTTPError as e:
+        detail = e.read(512).decode("utf-8", "replace")
+        if e.code == 401:
+            raise HTTPException(401, "invalid Jellyfin username or password")
+        if e.code == 403:
+            raise HTTPException(403, "Jellyfin rejected this login")
+        log.warning("Jellyfin request failed: status=%s body=%s", e.code, detail)
+        raise HTTPException(502, "Jellyfin authentication failed")
+    except _uerr.URLError as e:
+        log.warning("Jellyfin request failed: %s", e)
+        raise HTTPException(502, "Jellyfin is unreachable")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        log.warning("Jellyfin returned non-JSON response from %s", path)
+        raise HTTPException(502, "Jellyfin returned an invalid authentication response")
+
+def _jellyfin_logout(access_token: str):
+    if not access_token:
+        return
+    try:
+        _jellyfin_post("/Sessions/Logout", {}, token=access_token)
+    except HTTPException as e:
+        log.debug("Jellyfin logout cleanup failed: %s", e.detail)
+
+def _authenticate_jellyfin(username: str, password: str) -> dict:
+    username = username.strip()
+    if not JELLYFIN_ENABLED:
+        raise HTTPException(404, "Jellyfin login is disabled")
+    if not username:
+        raise HTTPException(400, "username is required")
+    if not password and not JELLYFIN_ALLOW_EMPTY_PASSWORD:
+        raise HTTPException(400, "empty Jellyfin passwords are disabled")
+
+    result = _jellyfin_post(
+        "/Users/AuthenticateByName",
+        {"Username": username, "Pw": password},
+    )
+    access_token = result.get("AccessToken", "")
+    jellyfin_user = result.get("User") or {}
+    jellyfin_name = (jellyfin_user.get("Name") or username).strip()
+    jellyfin_id = str(jellyfin_user.get("Id") or "").strip()
+    server_id = str(result.get("ServerId") or jellyfin_user.get("ServerId") or "").strip()
+    subject = jellyfin_id or f"{server_id}:{jellyfin_name.lower()}"
+    if not subject.strip(":"):
+        raise HTTPException(502, "Jellyfin did not return a stable user identifier")
+
+    allowed_candidates = {jellyfin_name.lower(), subject.lower()}
+    if JELLYFIN_ALLOWED_USERS and not (JELLYFIN_ALLOWED_USERS & allowed_candidates):
+        _jellyfin_logout(access_token)
+        raise HTTPException(403, "Jellyfin user is not allowed for Enkodu")
+
+    policy = jellyfin_user.get("Policy") or {}
+    if JELLYFIN_REQUIRE_ADMIN and not bool(policy.get("IsAdministrator")):
+        _jellyfin_logout(access_token)
+        raise HTTPException(403, "Jellyfin administrator access is required")
+
+    _jellyfin_logout(access_token)
+    return {
+        "subject": subject,
+        "username": jellyfin_name,
+        "display_name": jellyfin_name,
+    }
+
+def _login_jellyfin_user(identity: dict):
+    subject = identity["subject"]
+    username = identity["username"].strip()
+    display_name = identity.get("display_name") or username
+    now = _now()
+    with db() as conn:
+        user = conn.execute("""
+            SELECT * FROM auth_users
+            WHERE source='jellyfin' AND external_subject=?
+        """, (subject,)).fetchone()
+        if not user and JELLYFIN_AUTO_LINK_LOCAL_USERS:
+            user = conn.execute(
+                "SELECT * FROM auth_users WHERE source='local' AND username=?",
+                (username,),
+            ).fetchone()
+            if user:
+                try:
+                    conn.execute("""
+                        UPDATE auth_users
+                        SET source='jellyfin', external_subject=?, display_name=?,
+                            updated_at=?
+                        WHERE id=?
+                    """, (subject, display_name, now, user["id"]))
+                    conn.commit()
+                    user = conn.execute("SELECT * FROM auth_users WHERE id=?", (user["id"],)).fetchone()
+                except sqlite3.IntegrityError:
+                    raise HTTPException(409, "Jellyfin user is already linked to another account")
+        if not user:
+            if not JELLYFIN_AUTO_CREATE_USERS:
+                raise HTTPException(403, "user is not provisioned for Enkodu")
+            if conn.execute("SELECT id FROM auth_users WHERE username=?", (username,)).fetchone():
+                raise HTTPException(
+                    409,
+                    "Enkodu username already exists; pre-provision or rename the Jellyfin user",
+                )
+            user_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO auth_users
+                    (id, username, display_name, email, role, source, external_subject,
+                     enabled, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (
+                user_id, username, display_name, None, JELLYFIN_DEFAULT_ROLE,
+                "jellyfin", subject, 1, now, now,
+            ))
+            conn.commit()
+            user = conn.execute("SELECT * FROM auth_users WHERE id=?", (user_id,)).fetchone()
+        if not user["enabled"]:
+            raise HTTPException(403, "user is disabled")
+    return user
 
 # ── scanner ───────────────────────────────────────────────────────────────────
 
@@ -391,14 +1039,592 @@ def scanner_loop():
             log.error("Scanner error: %s", e)
         time.sleep(SCAN_INTERVAL)
 
+# ── resumable upload cleanup ──────────────────────────────────────────────────
+
+RESUMABLE_EXPIRY_SECONDS = 86400  # 24 hours
+
+def _cleanup_resumable_uploads():
+    """Remove stale resumable upload directories older than 24h."""
+    while True:
+        time.sleep(3600)  # run every hour
+        try:
+            if not UPLOADS_ROOT.exists():
+                continue
+            now = time.time()
+            removed = 0
+            for entry in UPLOADS_ROOT.iterdir():
+                if entry.is_dir() and entry.name.startswith("resumable_"):
+                    mtime = entry.stat().st_mtime
+                    if now - mtime > RESUMABLE_EXPIRY_SECONDS:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed += 1
+            if removed:
+                log.info("Cleaned up %d stale resumable upload directories", removed)
+        except Exception as e:
+            log.warning("Resumable cleanup error: %s", e)
+
+# ── SHA-256 helpers ─────────────────────────────────────────────────────────────
+
+def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
+
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Yulia AV1 Queue")
+_SESSION_SECRET = AUTH_SESSION_SECRET or secrets.token_urlsafe(32)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_SESSION_SECRET,
+    same_site="lax",
+    https_only=AUTH_COOKIE_SECURE,
+    session_cookie="enkodu_oauth_state",
+)
 
-@app.on_event("startup")
-def startup():
-    threading.Thread(target=scanner_loop, daemon=True).start()
-    threading.Thread(target=_stall_watchdog, daemon=True).start()
+oauth = OAuth() if OAuth else None
+if oauth and AUTHENTIK_ENABLED and AUTHENTIK_DISCOVERY_URL and AUTHENTIK_CLIENT_ID and AUTHENTIK_CLIENT_SECRET:
+    oauth.register(
+        name="authentik",
+        client_id=AUTHENTIK_CLIENT_ID,
+        client_secret=AUTHENTIK_CLIENT_SECRET,
+        server_metadata_url=AUTHENTIK_DISCOVERY_URL,
+        client_kwargs={"scope": "openid profile email"},
+    )
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if not AUTH_ENABLED or request.method == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if _is_public_auth_path(path):
+        return await call_next(request)
+
+    user = _current_user(request)
+    if user:
+        required = _required_role(request.method, path)
+        if not _user_has_role(user, required):
+            return _auth_forbidden_response(f"{required} role required")
+        request.state.auth_user = user
+        return await call_next(request)
+
+    if _has_api_token(request):
+        request.state.auth_token_kind = "api"
+        return await call_next(request)
+
+    is_worker_endpoint = _is_worker_endpoint(request.method, path)
+    is_companion_endpoint = _is_companion_endpoint(request.method, path)
+    if is_worker_endpoint or is_companion_endpoint:
+        if is_worker_endpoint and AUTH_WORKER_TOKEN and _has_worker_token(request):
+            request.state.auth_token_kind = "worker"
+            return await call_next(request)
+        if is_companion_endpoint and AUTH_COMPANION_TOKEN and _has_companion_token(request):
+            request.state.auth_token_kind = "companion"
+            return await call_next(request)
+        if is_worker_endpoint and not AUTH_WORKER_TOKEN and AUTH_LEGACY_MACHINE_ACCESS:
+            request.state.auth_token_kind = "legacy-worker"
+            return await call_next(request)
+        if is_companion_endpoint and not AUTH_COMPANION_TOKEN and AUTH_LEGACY_MACHINE_ACCESS:
+            request.state.auth_token_kind = "legacy-companion"
+            return await call_next(request)
+        return _auth_required_response(request)
+
+    return _auth_required_response(request)
+
+if __name__ != "__main__":
+    @app.on_event("startup")
+    def startup():
+        if AUTH_ENABLED and not AUTH_SESSION_SECRET:
+            log.warning("AUTH_SESSION_SECRET is unset; Authentik/OIDC state cookies reset on restart")
+        if AUTH_ENABLED and AUTH_LEGACY_MACHINE_ACCESS and not AUTH_WORKER_TOKEN:
+            log.warning("AUTH_WORKER_TOKEN is unset; worker endpoints remain legacy-open")
+        if AUTH_ENABLED and AUTH_LEGACY_MACHINE_ACCESS and not AUTH_COMPANION_TOKEN:
+            log.warning("AUTH_COMPANION_TOKEN is unset; companion endpoints remain legacy-open")
+        if AUTHENTIK_ENABLED and not oauth:
+            log.warning("AUTHENTIK_ENABLED=true but Authlib is not installed")
+        if AUTHENTIK_ENABLED and oauth and "authentik" not in oauth._clients:
+            log.warning("AUTHENTIK_ENABLED=true but Authentik OIDC env vars are incomplete")
+        if JELLYFIN_ENABLED and not JELLYFIN_URL:
+            log.warning("JELLYFIN_ENABLED=true but JELLYFIN_URL is unset")
+        threading.Thread(target=scanner_loop, daemon=True).start()
+        threading.Thread(target=_stall_watchdog, daemon=True).start()
+        threading.Thread(target=_cleanup_resumable_uploads, daemon=True).start()
+
+# ── auth endpoints ────────────────────────────────────────────────────────────
+
+def _auth_page_shell(title: str, body: str) -> str:
+    return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>{title}</title>
+<style>
+*{{box-sizing:border-box}}body{{margin:0;background:#0d0d1a;color:#e0e0e0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;min-height:100vh;display:grid;place-items:center;padding:24px}}
+.panel{{width:min(460px,100%);background:#13132a;border:1px solid #252548;border-radius:12px;padding:28px;box-shadow:0 20px 80px #0008}}
+h1{{font-size:22px;letter-spacing:3px;margin:0 0 8px;background:linear-gradient(90deg,#f48fb1,#ce93d8,#80cbc4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+.sub{{color:#777;font-size:12px;line-height:1.6;margin-bottom:22px}}
+label{{display:block;color:#999;font-size:11px;letter-spacing:1px;margin:14px 0 6px}}
+input{{width:100%;background:#0d0d1a;border:1px solid #303050;color:#e0e0e0;border-radius:8px;padding:11px 12px;font:inherit}}
+input:focus{{outline:none;border-color:#ce93d8}}
+button,.btn{{width:100%;display:block;text-align:center;background:#ce93d822;border:1px solid #ce93d866;color:#ce93d8;border-radius:9px;padding:12px 14px;font:inherit;font-size:12px;letter-spacing:1.5px;cursor:pointer;text-decoration:none;margin-top:16px}}
+button:hover,.btn:hover{{background:#ce93d833}}
+.secondary{{background:#80cbc411;border-color:#80cbc444;color:#80cbc4}}
+.error{{color:#ef9a9a;font-size:12px;line-height:1.5;min-height:18px;margin-top:14px}}
+.hint{{color:#555;font-size:11px;line-height:1.6;margin-top:16px}}
+code{{color:#80cbc4}}
+</style></head><body><main class=panel>{body}</main></body></html>"""
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(next: str = "/"):
+    authentik_link = ""
+    if AUTHENTIK_ENABLED:
+        authentik_link = '<a class="btn secondary" href="/auth/authentik/login">Login with Authentik</a>'
+    jellyfin_link = ""
+    if JELLYFIN_ENABLED:
+        jellyfin_link = f'<a class="btn secondary" href="/auth/jellyfin/login?next={quote(next or "/")}">Login with Jellyfin</a>'
+    next_json = json.dumps(next or "/")
+    body = f"""
+<h1>ENKODU LOGIN</h1>
+<div class=sub>Passkey-first access. There are no dashboard passwords; recovery and new passkey setup happen from the server command line.</div>
+<label for=username>Username</label>
+<input id=username autocomplete=username autofocus>
+<button onclick="loginPasskey()">Use passkey</button>
+{authentik_link}
+{jellyfin_link}
+<div class=error id=err></div>
+<div class=hint>Passkeys require HTTPS or localhost. Use <code>python main.py auth invite USER</code> on the server to recover access.</div>
+<script>
+const NEXT = {next_json};
+function b64urlToBuf(v) {{
+  v = v.replace(/-/g, '+').replace(/_/g, '/');
+  v += '='.repeat((4 - v.length % 4) % 4);
+  const bin = atob(v);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}}
+function bufToB64url(buf) {{
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+}}
+function prepGet(o) {{
+  o.challenge = b64urlToBuf(o.challenge);
+  o.allowCredentials = (o.allowCredentials || []).map(c => ({{...c, id: b64urlToBuf(c.id)}}));
+  return o;
+}}
+function credJSON(c) {{
+  return {{
+    id: c.id,
+    rawId: bufToB64url(c.rawId),
+    type: c.type,
+    authenticatorAttachment: c.authenticatorAttachment,
+    response: {{
+      authenticatorData: bufToB64url(c.response.authenticatorData),
+      clientDataJSON: bufToB64url(c.response.clientDataJSON),
+      signature: bufToB64url(c.response.signature),
+      userHandle: c.response.userHandle ? bufToB64url(c.response.userHandle) : null
+    }}
+  }};
+}}
+async function loginPasskey() {{
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {{
+    const username = document.getElementById('username').value.trim();
+    const optRes = await fetch('/auth/passkey/login/options', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{username}})
+    }});
+    if (!optRes.ok) throw new Error((await optRes.json()).detail || 'login unavailable');
+    const data = await optRes.json();
+    const cred = await navigator.credentials.get({{publicKey: prepGet(data.publicKey)}});
+    const verify = await fetch('/auth/passkey/login/verify', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{challenge_id:data.challenge_id, credential:credJSON(cred)}})
+    }});
+    if (!verify.ok) throw new Error((await verify.json()).detail || 'passkey rejected');
+    location.href = NEXT || '/';
+  }} catch (e) {{
+    err.textContent = e.message || String(e);
+  }}
+}}
+</script>"""
+    return _auth_page_shell("Enkodu Login", body)
+
+@app.get("/auth/setup", response_class=HTMLResponse)
+def setup_page(token: str = ""):
+    token_json = json.dumps(token or "")
+    body = f"""
+<h1>SET UP PASSKEY</h1>
+<div class=sub>Register a local Enkodu passkey. This one-time setup link comes from the server command line and is consumed after registration.</div>
+<label for=keyname>Passkey name</label>
+<input id=keyname value="Primary passkey">
+<button onclick="registerPasskey()">Create passkey</button>
+<div class=error id=err></div>
+<div class=hint>Use the platform authenticator when possible. Password recovery stays intentionally command-line only for this release.</div>
+<script>
+const TOKEN = {token_json};
+function b64urlToBuf(v) {{
+  v = v.replace(/-/g, '+').replace(/_/g, '/');
+  v += '='.repeat((4 - v.length % 4) % 4);
+  const bin = atob(v);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}}
+function bufToB64url(buf) {{
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+}}
+function prepCreate(o) {{
+  o.challenge = b64urlToBuf(o.challenge);
+  o.user.id = b64urlToBuf(o.user.id);
+  o.excludeCredentials = (o.excludeCredentials || []).map(c => ({{...c, id: b64urlToBuf(c.id)}}));
+  return o;
+}}
+function credJSON(c) {{
+  return {{
+    id: c.id,
+    rawId: bufToB64url(c.rawId),
+    type: c.type,
+    authenticatorAttachment: c.authenticatorAttachment,
+    response: {{
+      attestationObject: bufToB64url(c.response.attestationObject),
+      clientDataJSON: bufToB64url(c.response.clientDataJSON),
+      transports: c.response.getTransports ? c.response.getTransports() : []
+    }}
+  }};
+}}
+async function registerPasskey() {{
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {{
+    if (!TOKEN) throw new Error('missing setup token');
+    const optRes = await fetch('/auth/passkey/register/options', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{token:TOKEN}})
+    }});
+    if (!optRes.ok) throw new Error((await optRes.json()).detail || 'setup link expired');
+    const data = await optRes.json();
+    const cred = await navigator.credentials.create({{publicKey: prepCreate(data.publicKey)}});
+    const verify = await fetch('/auth/passkey/register/verify', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{token:TOKEN, name:document.getElementById('keyname').value.trim(), credential:credJSON(cred)}})
+    }});
+    if (!verify.ok) throw new Error((await verify.json()).detail || 'passkey rejected');
+    location.href = '/';
+  }} catch (e) {{
+    err.textContent = e.message || String(e);
+  }}
+}}
+</script>"""
+    return _auth_page_shell("Enkodu Passkey Setup", body)
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    user = _current_user(request)
+    return {"authenticated": bool(user), "user": user}
+
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    response = JSONResponse({"ok": True})
+    _clear_session_cookie(response, request)
+    return response
+
+@app.get("/auth/jellyfin/login", response_class=HTMLResponse)
+def jellyfin_login_page(next: str = "/"):
+    if not JELLYFIN_ENABLED:
+        raise HTTPException(404, "Jellyfin login is disabled")
+    if not JELLYFIN_URL:
+        raise HTTPException(503, "JELLYFIN_URL is not configured")
+    next_json = json.dumps(_safe_next_url(next))
+    allow_empty_note = (
+        "This server accepts Jellyfin passwordless users."
+        if JELLYFIN_ALLOW_EMPTY_PASSWORD
+        else "Empty Jellyfin passwords are disabled here."
+    )
+    body = f"""
+<h1>JELLYFIN LOGIN</h1>
+<div class=sub>Use your Jellyfin account once to create an Enkodu session. Enkodu does not store this password.</div>
+<label for=username>Jellyfin username</label>
+<input id=username autocomplete=username autofocus>
+<label for=password>Jellyfin password</label>
+<input id=password type=password autocomplete=current-password>
+<button onclick="loginJellyfin()">Login with Jellyfin</button>
+<a class="btn secondary" href="/login?next={quote(_safe_next_url(next))}">Use passkey instead</a>
+<div class=error id=err></div>
+<div class=hint>{allow_empty_note} Passkeys remain the recommended day-to-day login and CLI recovery path.</div>
+<script>
+const NEXT = {next_json};
+async function loginJellyfin() {{
+  const err = document.getElementById('err');
+  err.textContent = '';
+  try {{
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    const res = await fetch('/auth/jellyfin/login', {{
+      method:'POST', headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{username, password, next:NEXT}})
+    }});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Jellyfin login failed');
+    location.href = data.next || '/';
+  }} catch (e) {{
+    err.textContent = e.message || String(e);
+  }}
+}}
+document.getElementById('password').addEventListener('keydown', e => {{
+  if (e.key === 'Enter') loginJellyfin();
+}});
+</script>"""
+    return _auth_page_shell("Enkodu Jellyfin Login", body)
+
+@app.post("/auth/jellyfin/login")
+def jellyfin_login(req: JellyfinLoginReq, request: Request):
+    identity = _authenticate_jellyfin(req.username, req.password)
+    user = _login_jellyfin_user(identity)
+    response = JSONResponse({"ok": True, "next": _safe_next_url(req.next), "user": _user_dict(user)})
+    _set_session_cookie(response, user["id"], request)
+    return response
+
+@app.post("/auth/passkey/register/options")
+def passkey_register_options(req: PasskeyRegisterOptionsReq, request: Request):
+    _require_webauthn()
+    with db() as conn:
+        invite = _lookup_invite(conn, req.token)
+        if not invite:
+            raise HTTPException(400, "setup link is invalid or expired")
+        creds = conn.execute(
+            "SELECT credential_id FROM auth_passkeys WHERE user_id=?",
+            (invite["user_id"],),
+        ).fetchall()
+        exclude = [
+            PublicKeyCredentialDescriptor(
+                id=base64url_to_bytes(r["credential_id"]),
+                type=PublicKeyCredentialType.PUBLIC_KEY,
+            )
+            for r in creds
+        ]
+        options = generate_registration_options(
+            rp_id=_auth_rp_id(request),
+            rp_name=AUTH_RP_NAME,
+            user_name=invite["username"],
+            user_id=invite["user_id"].encode("utf-8"),
+            user_display_name=invite["display_name"],
+            authenticator_selection=AuthenticatorSelectionCriteria(
+                user_verification=UserVerificationRequirement.REQUIRED,
+            ),
+            exclude_credentials=exclude,
+        )
+        challenge_id = _store_challenge(
+            conn,
+            invite["user_id"],
+            "register",
+            bytes_to_base64url(options.challenge),
+            token=req.token,
+        )
+    return {"challenge_id": challenge_id, "publicKey": json.loads(options_to_json(options))}
+
+@app.post("/auth/passkey/register/verify")
+def passkey_register_verify(req: PasskeyRegisterVerifyReq, request: Request):
+    _require_webauthn()
+    with db() as conn:
+        invite = _lookup_invite(conn, req.token)
+        if not invite:
+            raise HTTPException(400, "setup link is invalid or expired")
+        challenge = conn.execute("""
+            SELECT * FROM auth_challenges
+            WHERE kind='register' AND token=? AND user_id=? AND consumed_at IS NULL AND expires_at>?
+            ORDER BY created_at DESC LIMIT 1
+        """, (req.token, invite["user_id"], _now())).fetchone()
+        if not challenge:
+            raise HTTPException(400, "registration challenge expired")
+        try:
+            verified = verify_registration_response(
+                credential=req.credential,
+                expected_challenge=base64url_to_bytes(challenge["challenge"]),
+                expected_rp_id=_auth_rp_id(request),
+                expected_origin=_expected_origins(request),
+                require_user_verification=True,
+            )
+        except Exception as e:
+            raise HTTPException(400, f"passkey registration failed: {e}")
+
+        credential_id = bytes_to_base64url(verified.credential_id)
+        transports = req.credential.get("response", {}).get("transports") or []
+        now = _now()
+        try:
+            conn.execute("""
+                INSERT INTO auth_passkeys
+                    (id, user_id, credential_id, credential_public_key, sign_count,
+                     transports, name, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                str(uuid.uuid4()), invite["user_id"], credential_id,
+                verified.credential_public_key, verified.sign_count,
+                json.dumps(transports), req.name or "Passkey", now,
+            ))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "passkey is already registered")
+        _consume_challenge(conn, challenge["id"])
+        conn.execute("UPDATE auth_challenges SET consumed_at=? WHERE id=?",
+                     (now, invite["id"]))
+        conn.commit()
+    response = JSONResponse({"ok": True})
+    _set_session_cookie(response, invite["user_id"], request)
+    return response
+
+@app.post("/auth/passkey/login/options")
+def passkey_login_options(req: PasskeyLoginOptionsReq, request: Request):
+    _require_webauthn()
+    username = req.username.strip()
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM auth_users WHERE username=? AND enabled=1",
+            (username,),
+        ).fetchone()
+        if not user:
+            raise HTTPException(404, "unknown user")
+        creds = conn.execute(
+            "SELECT credential_id FROM auth_passkeys WHERE user_id=?",
+            (user["id"],),
+        ).fetchall()
+        if not creds:
+            raise HTTPException(400, "user has no passkeys; use a CLI setup invite")
+        allow = [
+            PublicKeyCredentialDescriptor(
+                id=base64url_to_bytes(r["credential_id"]),
+                type=PublicKeyCredentialType.PUBLIC_KEY,
+            )
+            for r in creds
+        ]
+        options = generate_authentication_options(
+            rp_id=_auth_rp_id(request),
+            allow_credentials=allow,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
+        challenge_id = _store_challenge(
+            conn,
+            user["id"],
+            "login",
+            bytes_to_base64url(options.challenge),
+        )
+    return {"challenge_id": challenge_id, "publicKey": json.loads(options_to_json(options))}
+
+@app.post("/auth/passkey/login/verify")
+def passkey_login_verify(req: PasskeyLoginVerifyReq, request: Request):
+    _require_webauthn()
+    credential_id = req.credential.get("rawId") or req.credential.get("id")
+    if not credential_id:
+        raise HTTPException(400, "missing credential id")
+    with db() as conn:
+        challenge = conn.execute("""
+            SELECT * FROM auth_challenges
+            WHERE id=? AND kind='login' AND consumed_at IS NULL AND expires_at>?
+        """, (req.challenge_id, _now())).fetchone()
+        if not challenge:
+            raise HTTPException(400, "login challenge expired")
+        passkey = conn.execute("""
+            SELECT p.*, u.enabled
+            FROM auth_passkeys p
+            JOIN auth_users u ON u.id=p.user_id
+            WHERE p.credential_id=? AND p.user_id=?
+        """, (credential_id, challenge["user_id"])).fetchone()
+        if not passkey or not passkey["enabled"]:
+            raise HTTPException(400, "passkey is not registered for this user")
+        try:
+            verified = verify_authentication_response(
+                credential=req.credential,
+                expected_challenge=base64url_to_bytes(challenge["challenge"]),
+                expected_rp_id=_auth_rp_id(request),
+                expected_origin=_expected_origins(request),
+                credential_public_key=passkey["credential_public_key"],
+                credential_current_sign_count=passkey["sign_count"],
+                require_user_verification=True,
+            )
+        except Exception as e:
+            raise HTTPException(400, f"passkey login failed: {e}")
+        now = _now()
+        conn.execute(
+            "UPDATE auth_passkeys SET sign_count=?, last_used=? WHERE id=?",
+            (verified.new_sign_count, now, passkey["id"]),
+        )
+        _consume_challenge(conn, challenge["id"])
+        conn.commit()
+    response = JSONResponse({"ok": True})
+    _set_session_cookie(response, challenge["user_id"], request)
+    return response
+
+@app.get("/auth/authentik/login")
+async def authentik_login(request: Request):
+    if not AUTHENTIK_ENABLED:
+        raise HTTPException(404, "Authentik login is disabled")
+    if not oauth or "authentik" not in oauth._clients:
+        raise HTTPException(503, "Authentik OIDC is not configured")
+    redirect_uri = request.url_for("authentik_callback")
+    return await oauth.authentik.authorize_redirect(request, redirect_uri)
+
+@app.get("/auth/authentik/callback", name="authentik_callback")
+async def authentik_callback(request: Request):
+    if not AUTHENTIK_ENABLED:
+        raise HTTPException(404, "Authentik login is disabled")
+    if not oauth or "authentik" not in oauth._clients:
+        raise HTTPException(503, "Authentik OIDC is not configured")
+    token = await oauth.authentik.authorize_access_token(request)
+    userinfo = token.get("userinfo") or await oauth.authentik.userinfo(token=token)
+    sub = userinfo.get("sub")
+    email = (userinfo.get("email") or "").strip().lower() or None
+    username = (userinfo.get("preferred_username") or email or sub or "").strip()
+    display_name = (userinfo.get("name") or username or "Authentik User").strip()
+    if not sub:
+        raise HTTPException(400, "Authentik did not return a subject")
+    if AUTHENTIK_ALLOWED_EMAIL_DOMAIN and (
+        not email or not email.endswith("@" + AUTHENTIK_ALLOWED_EMAIL_DOMAIN)
+    ):
+        raise HTTPException(403, "email domain is not allowed")
+
+    now = _now()
+    with db() as conn:
+        user = conn.execute("""
+            SELECT * FROM auth_users
+            WHERE source='authentik' AND external_subject=?
+        """, (sub,)).fetchone()
+        if not user and email:
+            user = conn.execute("SELECT * FROM auth_users WHERE email=?", (email,)).fetchone()
+            if user:
+                conn.execute("""
+                    UPDATE auth_users
+                    SET source='authentik', external_subject=?, display_name=?,
+                        updated_at=?
+                    WHERE id=?
+                """, (sub, display_name, now, user["id"]))
+                conn.commit()
+                user = conn.execute("SELECT * FROM auth_users WHERE id=?", (user["id"],)).fetchone()
+        if not user:
+            if not AUTHENTIK_AUTO_CREATE_USERS:
+                raise HTTPException(403, "user is not provisioned for Enkodu")
+            user_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO auth_users
+                    (id, username, display_name, email, role, source, external_subject,
+                     enabled, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+            """, (
+                user_id, username, display_name, email, AUTHENTIK_DEFAULT_ROLE,
+                "authentik", sub, 1, now, now,
+            ))
+            conn.commit()
+            user = conn.execute("SELECT * FROM auth_users WHERE id=?", (user_id,)).fetchone()
+        if not user["enabled"]:
+            raise HTTPException(403, "user is disabled")
+    response = RedirectResponse("/", status_code=303)
+    _set_session_cookie(response, user["id"], request)
+    return response
 
 # ── endpoints ─────────────────────────────────────────────────────────────────
 
@@ -510,6 +1736,132 @@ def status():
         "failed":  counts.get("failed",  0),
     }
 
+@app.get("/healthz")
+def healthz():
+    """Lightweight health check for load balancers and clients."""
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return {"ok": True, "version": "0.1.0"}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
+
+@app.get("/version")
+def version():
+    return {"version": "0.1.0", "build": "2026-06-10"}
+
+# ── telemetry ─────────────────────────────────────────────────────────────────
+
+def _init_telemetry():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT,
+                event_type TEXT NOT NULL,
+                event_detail TEXT,
+                job_id TEXT,
+                platform TEXT,
+                success INTEGER DEFAULT 1,
+                duration_ms INTEGER,
+                bytes_transferred INTEGER,
+                created_at REAL
+            )
+        """)
+        conn.commit()
+
+_init_telemetry()
+
+class TelemetryEvent(BaseModel):
+    client_id: str | None = None
+    event_type: str
+    event_detail: str | None = None
+    job_id: str | None = None
+    platform: str | None = None
+    success: bool = True
+    duration_ms: int | None = None
+    bytes_transferred: int | None = None
+
+_TELEMETRY_FIELD_LIMITS = {
+    "client_id": 128,
+    "event_type": 80,
+    "event_detail": 1024,
+    "job_id": 128,
+    "platform": 80,
+}
+_TELEMETRY_SECRET_RE = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
+    r"authorization|bearer\s+|nas_password|session)",
+    re.IGNORECASE,
+)
+_TELEMETRY_PATH_RE = re.compile(
+    r"(\\\\[^\\\s]+\\[^\\\s]+|[A-Za-z]:\\[^ \n\r\t]+|"
+    r"/(?:Users|home|mnt|data|var|etc|root)/[^ \n\r\t]+)"
+)
+
+def _validate_telemetry(req: TelemetryEvent):
+    for field, limit in _TELEMETRY_FIELD_LIMITS.items():
+        value = getattr(req, field)
+        if value is not None and len(value) > limit:
+            raise HTTPException(400, f"{field} is too long")
+    if not req.event_type.strip():
+        raise HTTPException(400, "event_type is required")
+    for field in ("duration_ms", "bytes_transferred"):
+        value = getattr(req, field)
+        if value is not None and value < 0:
+            raise HTTPException(400, f"{field} must be non-negative")
+    detail = req.event_detail or ""
+    if detail and _TELEMETRY_SECRET_RE.search(detail):
+        raise HTTPException(400, "event_detail appears to contain sensitive data")
+    if detail and len(_TELEMETRY_PATH_RE.findall(detail)) >= 2:
+        raise HTTPException(400, "event_detail contains too many local paths")
+
+@app.post("/telemetry")
+async def post_telemetry(req: TelemetryEvent):
+    _validate_telemetry(req)
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO telemetry
+                (client_id, event_type, event_detail, job_id, platform, success, duration_ms, bytes_transferred, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            req.client_id, req.event_type, req.event_detail, req.job_id, req.platform,
+            1 if req.success else 0, req.duration_ms, req.bytes_transferred, time.time()
+        ))
+        conn.commit()
+    return {"ok": True}
+
+@app.get("/telemetry/summary")
+def telemetry_summary(days: int = 7):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT event_type, platform,
+                   COUNT(*) as total,
+                   SUM(success) as successes,
+                   SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) as failures,
+                   AVG(duration_ms) as avg_duration_ms,
+                   AVG(bytes_transferred) as avg_bytes
+            FROM telemetry
+            WHERE created_at > ?
+            GROUP BY event_type, platform
+        """, (time.time() - days * 86400,)).fetchall()
+    return {
+        "ok": True,
+        "days": days,
+        "events": [
+            {
+                "event_type": r["event_type"],
+                "platform": r["platform"],
+                "total": r["total"],
+                "successes": r["successes"],
+                "failures": r["failures"],
+                "avg_duration_ms": round(r["avg_duration_ms"] or 0, 1),
+                "avg_bytes": round(r["avg_bytes"] or 0, 1),
+            }
+            for r in rows
+        ]
+    }
+
 @app.get("/workers")
 def list_workers():
     now = time.time()
@@ -571,19 +1923,32 @@ class BulkDeleteReq(BaseModel):
     ids: list
     rename: bool = False
 
+def _is_verified_pass(row) -> bool:
+    return row["status"] == "done" and row["verify_status"] == "pass"
+
+def _require_verified_output(row):
+    if not _is_verified_pass(row):
+        raise HTTPException(404, "verified output not available")
+    out = Path(row["output_path"]) if row["output_path"] else None
+    if not out or not out.exists():
+        raise HTTPException(404, "verified output not found on disk")
+    return out
+
 def _do_delete_original(job_id: str, rename: bool) -> dict:
     with db() as conn:
         row = conn.execute(
-            "SELECT status, source_path, output_path, source_filename FROM jobs WHERE id=?",
+            "SELECT status, verify_status, source_path, output_path, source_filename FROM jobs WHERE id=?",
             (job_id,)
         ).fetchone()
     if not row:
         raise HTTPException(404, "job not found")
     if row["status"] != "done":
         raise HTTPException(400, "job not done")
+    if row["verify_status"] != "pass":
+        raise HTTPException(400, "job output is not verified")
 
     src = Path(row["source_path"]) if row["source_path"] else None
-    out = Path(row["output_path"]) if row["output_path"] else None
+    out = _require_verified_output(row)
 
     deleted = False
     renamed_to = None
@@ -1305,26 +2670,293 @@ async def upload_job(request: Request, x_filename: str = Header(...),
     _tg(f"📤 <b>Upload</b>  {orig_filename}\n👤 {client_name} · 💾 {size/1e9:.2f} GB · queue #{pos+1}")
     return {"job_id": job_id, "priority_position": pos + 1, "client_name": client_name}
 
+class UploadSession:
+    """In-memory resumable upload session."""
+    def __init__(self, upload_id: str, filename: str, filepath: str | None,
+                 total_size: int, chunk_size: int = 8 * 1024 * 1024):
+        self.upload_id = upload_id
+        self.filename = filename
+        self.filepath = filepath
+        self.total_size = total_size
+        self.chunk_size = chunk_size
+        self.received = 0
+        self.dir = UPLOADS_ROOT / f"resumable_{upload_id}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.data_path = self.dir / "data.bin"
+        self.meta_path = self.dir / "meta.json"
+        self.created_at = time.time()
+        self._save_meta()
+
+    def _save_meta(self):
+        self.meta_path.write_text(json.dumps({
+            "upload_id": self.upload_id,
+            "filename": self.filename,
+            "filepath": self.filepath,
+            "total_size": self.total_size,
+            "chunk_size": self.chunk_size,
+            "received": self.received,
+            "created_at": self.created_at,
+        }))
+
+    def write_chunk(self, start: int, data: bytes) -> int:
+        with open(self.data_path, "r+b") as f:
+            f.seek(start)
+            f.write(data)
+        self.received += len(data)
+        self._save_meta()
+        return self.received
+
+    def is_complete(self) -> bool:
+        return self.received >= self.total_size
+
+    def finalize(self) -> Path:
+        """Return the finalized input path."""
+        ext = Path(self.filename).suffix or ".mp4"
+        final = self.dir / f"input{ext}"
+        self.data_path.rename(final)
+        return final
+
+
+# Upload sessions in memory (lost on server restart; clients must restart)
+_resumable_uploads: dict[str, UploadSession] = {}
+
+CHUNK_SIZE = 8 * 1024 * 1024  # 8 MiB
+
+class ResumableStartReq(BaseModel):
+    filename: str
+    filepath: str | None = None
+    total_size: int
+
+@app.post("/jobs/upload/resumable/start")
+async def resumable_start(req: ResumableStartReq):
+    """Start a resumable upload session."""
+    upload_id = str(uuid.uuid4())
+    session = UploadSession(
+        upload_id=upload_id,
+        filename=_fix_mojibake(req.filename),
+        filepath=_fix_mojibake(req.filepath) if req.filepath else None,
+        total_size=req.total_size,
+        chunk_size=CHUNK_SIZE,
+    )
+    _resumable_uploads[upload_id] = session
+    log.info("Resumable upload started: %s (%s, %d bytes)", upload_id, req.filename, req.total_size)
+    return {
+        "upload_id": upload_id,
+        "chunk_size": CHUNK_SIZE,
+        "expires_in": 86400,
+    }
+
+@app.put("/jobs/upload/resumable/{upload_id}/chunk")
+async def resumable_chunk(upload_id: str, request: Request,
+                          content_range: str = Header(..., alias="Content-Range")):
+    """Upload a chunk for a resumable session. Content-Range: bytes {start}-{end}/{total}"""
+    session = _resumable_uploads.get(upload_id)
+    if not session:
+        raise HTTPException(404, "upload session not found")
+
+    # Parse Content-Range header
+    try:
+        range_part = content_range.split("bytes ")[1]
+        range_spec, total = range_part.split("/")
+        start, end = range_spec.split("-")
+        start = int(start)
+        end = int(end)
+        total = int(total)
+    except Exception:
+        raise HTTPException(400, "invalid Content-Range header")
+
+    if total != session.total_size:
+        raise HTTPException(400, "total size mismatch")
+
+    data = await request.body()
+    if len(data) != (end - start + 1):
+        raise HTTPException(400, "chunk size mismatch")
+
+    received = session.write_chunk(start, data)
+    log.debug("Resumable chunk %s: %d-%d (%d/%d)", upload_id, start, end, received, total)
+    return {"ok": True, "received": received, "total": total}
+
+@app.post("/jobs/upload/resumable/{upload_id}/finish")
+async def resumable_finish(upload_id: str, request: Request):
+    """Finish a resumable upload and create the job."""
+    session = _resumable_uploads.get(upload_id)
+    if not session:
+        raise HTTPException(404, "upload session not found")
+
+    if not session.is_complete():
+        raise HTTPException(400, "upload incomplete")
+
+    input_path = session.finalize()
+    size = input_path.stat().st_size
+    meta = probe_video(str(input_path))
+    duration = meta.get("duration", 0.0)
+    orig_filename = session.filename
+    client_path = session.filepath
+
+    ip = (
+        request.headers.get("X-Real-IP")
+        or (request.headers.get("X-Forwarded-For", "").split(",")[0])
+        or (request.client.host if request.client else "unknown")
+    ).strip()
+
+    now = time.time()
+    with db() as conn:
+        client_name, _ = _get_or_create_client(conn, ip)
+        conn.execute("UPDATE clients SET uploads=uploads+1 WHERE ip=?", (ip,))
+
+        ext = Path(orig_filename).suffix or ".mp4"
+        output_path = UPLOADS_ROOT / f"resumable_{upload_id}" / f"{Path(orig_filename).stem}_av1.mp4"
+
+        # Dedup
+        twin = conn.execute("""
+            SELECT id, output_path, output_size, output_meta, verify_status, verify_detail, verify_checks
+            FROM jobs
+            WHERE status='done' AND verify_status='pass'
+              AND source_size=?
+              AND ABS(source_duration_secs - ?) < 2.0
+            LIMIT 1
+        """, (size, duration)).fetchone()
+
+        if twin and twin[1] and os.path.exists(twin[1]):
+            twin_id, twin_out, twin_out_size, twin_out_meta, twin_vs, twin_vd, twin_vc = twin
+            conn.execute("""
+                INSERT INTO jobs (id, source_path, output_path, source_unc, output_unc,
+                    source_size, source_duration_secs, status, priority, source_filename,
+                    source_meta, output_size, output_meta, verify_status, verify_detail,
+                    verify_checks, worker, percent, client_name, created_at, updated_at, client_path)
+                VALUES (?,?,?,?,?,?,?,'done',10,?,?,?,?,?,?,?,?,100.0,?,?,?,?)
+            """, (upload_id, str(input_path), twin_out, "", "",
+                  size, duration, orig_filename, json.dumps(meta),
+                  twin_out_size, twin_out_meta, twin_vs, twin_vd, twin_vc,
+                  "dedup", client_name, now, now, client_path))
+            conn.commit()
+            log.info("Resumable upload DEDUP [%s/%s]: %s → reusing output from job %s",
+                     client_name, ip, orig_filename, twin_id)
+            _resumable_uploads.pop(upload_id, None)
+            return {"job_id": upload_id, "priority_position": 0, "client_name": client_name, "deduped": True}
+
+        conn.execute("""
+            INSERT INTO jobs (id, source_path, output_path, source_unc, output_unc,
+                source_size, source_duration_secs, status, priority, source_filename,
+                source_meta, client_name, created_at, updated_at, client_path)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (upload_id, str(input_path), str(output_path), "", "",
+              size, duration, "pending", 10, orig_filename,
+              json.dumps(meta), client_name, now, now, client_path))
+        conn.commit()
+        pos = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='pending' AND priority >= 10 AND id != ?",
+            (upload_id,)
+        ).fetchone()[0]
+
+    log.info("Resumable upload complete [%s/%s]: %s (%.1f GB, %.0fs) → job %s",
+             client_name, ip, orig_filename, size/1e9, duration, upload_id)
+    _tg(f"📤 <b>Upload</b>  {orig_filename}\n👤 {client_name} · 💾 {size/1e9:.2f} GB · queue #{pos+1}")
+    _resumable_uploads.pop(upload_id, None)
+    return {"job_id": upload_id, "priority_position": pos + 1, "client_name": client_name}
+
+
 @app.get("/jobs/{job_id}/output")
-def download_output(job_id: str):
+def download_output(job_id: str, request: Request):
     with db() as conn:
         row = conn.execute(
-            "SELECT output_path, source_filename FROM jobs WHERE id=?", (job_id,)
+            "SELECT status, verify_status, output_path, source_filename FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
     if not row:
         raise HTTPException(404, "job not found")
-    path = Path(row["output_path"])
-    if not path.exists():
-        raise HTTPException(404, "output not ready")
+    path = _require_verified_output(row)
     original = row["source_filename"] or path.name
     out_name = Path(original).stem + "_av1.mp4"
+    total_size = path.stat().st_size
+
+    # Handle Range requests for resumable downloads
+    range_header = request.headers.get("range")
+    if range_header:
+        try:
+            range_part = range_header.split("=")[1]
+            start, end = range_part.split("-")
+            start = int(start)
+            end = int(end) if end else total_size - 1
+        except Exception:
+            raise HTTPException(400, "invalid range header")
+
+        if start >= total_size or end >= total_size or start > end:
+            raise HTTPException(416, "range not satisfiable")
+
+        def range_stream():
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                while remaining > 0:
+                    chunk_size = min(1 << 20, remaining)
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+                    remaining -= len(data)
+
+        return StreamingResponse(
+            range_stream(),
+            status_code=206,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Length": str(end - start + 1),
+                "Content-Range": f"bytes {start}-{end}/{total_size}",
+                "Accept-Ranges": "bytes",
+                "X-Filename": quote(out_name),
+            }
+        )
+
     def stream():
         with open(path, "rb") as f:
             while chunk := f.read(1 << 20):
                 yield chunk
+
+    # Compute SHA-256 lazily and cache it alongside the file
+    sha256 = _cached_sha256(path)
     return StreamingResponse(stream(), media_type="application/octet-stream",
-                             headers={"Content-Length": str(path.stat().st_size),
-                                      "X-Filename": quote(out_name)})
+                             headers={"Content-Length": str(total_size),
+                                      "Accept-Ranges": "bytes",
+                                      "X-Filename": quote(out_name),
+                                      "X-SHA256": sha256})
+
+# ── SHA-256 cache ───────────────────────────────────────────────────────────────
+
+_sha256_cache: dict[str, str] = {}
+
+def _cached_sha256(path: Path) -> str:
+    key = str(path)
+    mtime = path.stat().st_mtime
+    cached = _sha256_cache.get(key)
+    if cached and _sha256_cache.get(f"{key}:mtime") == str(mtime):
+        return cached
+    try:
+        h = sha256_file(str(path))
+        _sha256_cache[key] = h
+        _sha256_cache[f"{key}:mtime"] = str(mtime)
+        return h
+    except Exception:
+        return ""
+
+@app.get("/jobs/{job_id}/checksum")
+def get_checksum(job_id: str):
+    """Return SHA-256 checksums for source and output files."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT source_path, output_path, status, verify_status FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "job not found")
+    result: dict = {"job_id": job_id, "status": row["status"]}
+    src = row["source_path"]
+    out = row["output_path"]
+    if out and Path(out).exists() and not _is_verified_pass(row):
+        raise HTTPException(404, "verified output not available")
+    if src and Path(src).exists():
+        result["source_sha256"] = _cached_sha256(Path(src))
+    if out and Path(out).exists():
+        result["output_sha256"] = _cached_sha256(Path(out))
+    return result
 
 _COMPANION_BIN = Path(os.getenv("COMPANION_BIN", "/app/enkodu-macos"))
 
@@ -1499,6 +3131,7 @@ def get_stats():
 def dashboard():
     stall_to = STALL_TIMEOUT
     nas_data_root = _get_setting("nas_data_root", "/mnt/pool1/pool1_data/home/yulia")
+    auth_logout = '<button class="install-link" onclick="logout()">LOGOUT</button>' if AUTH_ENABLED else ""
     return f"""<!doctype html>
 <html><head><meta charset=utf-8><title>✦ ENKODU</title>
 <style>
@@ -1513,7 +3146,7 @@ body{{background:#0d0d1a;color:#e0e0e0;font-family:'DM Mono',monospace;font-size
 .tab{{background:none;border:none;color:#555;font-family:inherit;font-size:10px;letter-spacing:2px;padding:6px 16px;border-radius:8px;cursor:pointer;transition:all .2s}}
 .tab.active{{background:#1e1e3a;color:#e0e0e0}}
 .tab:hover:not(.active){{color:#999}}
-.install-link{{font-size:10px;letter-spacing:2px;color:#ce93d8;border:1px solid #ce93d844;padding:5px 12px;border-radius:8px;text-decoration:none;background:#ce93d811}}
+.install-link{{font-family:inherit;font-size:10px;letter-spacing:2px;color:#ce93d8;border:1px solid #ce93d844;padding:5px 12px;border-radius:8px;text-decoration:none;background:#ce93d811;cursor:pointer}}
 .install-link:hover{{background:#ce93d822}}
 .controls{{display:flex;gap:8px;margin-bottom:22px;flex-wrap:wrap;align-items:center}}
 .btn{{border:none;border-radius:8px;padding:7px 14px;font-family:inherit;font-size:10px;letter-spacing:1.5px;cursor:pointer;transition:all .2s;opacity:.55}}
@@ -1662,6 +3295,29 @@ a{{color:#f48fb1;text-decoration:none}}
 .rclient-table td:first-child{{text-align:left;color:#e0e0e0}}
 .rclient-table tr:first-child td{{border-top:none}}
 @media(max-width:800px){{.report-grid{{grid-template-columns:repeat(2,1fr)}}.report-row{{grid-template-columns:1fr}}}}
+/* nodes tab */
+.node-card{{background:#13132a;border:1px solid #1e1e3a;border-radius:12px;padding:16px 20px;margin-bottom:12px}}
+.node-header{{display:flex;align-items:center;gap:12px;margin-bottom:10px}}
+.node-dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0}}
+.node-dot.online{{background:#80cbc4;box-shadow:0 0 6px #80cbc488}}
+.node-dot.offline{{background:#333}}
+.node-name{{font-size:14px;color:#e0e0e0;font-weight:500}}
+.node-platform{{color:#555;font-size:10px;letter-spacing:2px;margin-left:auto}}
+.node-badges{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}}
+.node-badge{{border-radius:20px;padding:2px 10px;font-size:9px;letter-spacing:1px;border:1px solid}}
+.node-badge-enc{{background:#b39ddb22;color:#b39ddb;border-color:#b39ddb44}}
+.node-badge-pool{{background:#80cbc422;color:#80cbc4;border-color:#80cbc444}}
+.node-badge-worker{{background:#f48fb122;color:#f48fb1;border-color:#f48fb144}}
+.node-badge-disabled{{background:#33333322;color:#555;border-color:#33333344}}
+.node-actions{{display:flex;gap:8px;margin-top:10px}}
+.btn-promote{{background:#f48fb122;border:1px solid #f48fb155;color:#f48fb1;font-family:inherit;font-size:10px;letter-spacing:1.5px;padding:5px 14px;border-radius:8px;cursor:pointer;transition:all .2s}}
+.btn-promote:hover{{background:#f48fb144}}
+.nodes-empty{{color:#444;font-size:12px;padding:32px;text-align:center}}
+.pool-section{{margin-top:20px}}
+.pool-title{{color:#444;font-size:10px;letter-spacing:2px;margin-bottom:10px}}
+.queue-plan-section{{margin-top:20px}}
+.btn-build-queue{{background:#ce93d822;border:1px solid #ce93d855;color:#ce93d8;font-family:inherit;font-size:10px;letter-spacing:1.5px;padding:7px 16px;border-radius:8px;cursor:pointer;transition:all .2s}}
+.btn-build-queue:hover{{background:#ce93d844}}
 </style>
 </head>
 <body>
@@ -1672,9 +3328,11 @@ a{{color:#f48fb1;text-decoration:none}}
     <div class="tab-bar">
       <button class="tab active" id="tab-btn-queue" onclick="switchTab('queue')">QUEUE</button>
       <button class="tab" id="tab-btn-report" onclick="switchTab('report')">REPORT</button>
+      <button class="tab" id="tab-btn-nodes" onclick="switchTab('nodes')">NODES</button>
       <button class="tab" id="tab-btn-settings" onclick="switchTab('settings')">SETTINGS</button>
     </div>
     <a class="install-link" href="/install">⬇ ENKODU.APP</a>
+    {auth_logout}
   </div>
 </div>
 
@@ -1872,6 +3530,59 @@ a{{color:#f48fb1;text-decoration:none}}
   </div>
 </div>
 
+<!-- ── NODES TAB ── -->
+<div id="tab-nodes" style="display:none">
+  <div style="display:flex;align-items:center;gap:14px;margin-bottom:20px;flex-wrap:wrap">
+    <div style="color:#ce93d8;font-size:10px;letter-spacing:3px">COMPANION NODES</div>
+    <button class="btn-build-queue" onclick="buildQueuePlan()">⟳ BUILD QUEUE PLAN</button>
+    <span id="build-queue-ok" style="color:#80cbc4;font-size:11px;opacity:0;transition:opacity .3s">✓ built</span>
+  </div>
+  <div id="nodes-list"><div class="nodes-empty">loading…</div></div>
+
+  <div class="pool-section">
+    <div class="pool-title">FILE POOL</div>
+    <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center">
+      <select id="pool-filter-companion" class="sselect" onchange="loadFilePool()" style="font-size:11px;padding:5px 10px">
+        <option value="">All companions</option>
+      </select>
+      <select id="pool-filter-status" class="sselect" onchange="loadFilePool()" style="font-size:11px;padding:5px 10px">
+        <option value="">All statuses</option>
+        <option value="pending">pending</option>
+        <option value="excluded">excluded</option>
+        <option value="queued">queued</option>
+      </select>
+    </div>
+    <table>
+      <thead><tr>
+        <th>FILE</th>
+        <th style="width:80px">RES</th>
+        <th style="width:80px">CODEC</th>
+        <th style="width:90px">SIZE</th>
+        <th style="width:80px">STATUS</th>
+        <th style="width:110px">COMPANION</th>
+        <th style="width:80px">ACTION</th>
+      </tr></thead>
+      <tbody id="pool-tbody"><tr><td colspan="7" style="color:#444;text-align:center;padding:24px">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="queue-plan-section">
+    <div class="pool-title">QUEUE PLAN</div>
+    <table>
+      <thead><tr>
+        <th style="width:50px">#</th>
+        <th>FILE</th>
+        <th style="width:80px">RES</th>
+        <th style="width:80px">CODEC</th>
+        <th style="width:90px">SIZE</th>
+        <th style="width:80px">OUT CODEC</th>
+        <th style="width:110px">COMPANION</th>
+      </tr></thead>
+      <tbody id="plan-tbody"><tr><td colspan="7" style="color:#444;text-align:center;padding:24px">loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
 <script>
 const STALL_TIMEOUT = {stall_to};
 const NAS_DATA_ROOT = {repr(nas_data_root)};
@@ -1901,12 +3612,13 @@ const S = {{
 
 // ── tab switching ─────────────────────────────────────────────────────────────
 function switchTab(name) {{
-  ['queue','report','settings'].forEach(t => {{
+  ['queue','report','nodes','settings'].forEach(t => {{
     document.getElementById('tab-'+t).style.display = t===name ? '' : 'none';
     document.getElementById('tab-btn-'+t).classList.toggle('active', t===name);
   }});
   if (name === 'settings') loadSettings();
   if (name === 'report')   loadReport();
+  if (name === 'nodes')    loadNodes();
 }}
 
 // ── report ────────────────────────────────────────────────────────────────────
@@ -2723,6 +4435,11 @@ async function postAndRefresh(url) {{
   await loadJobs();
 }}
 
+async function logout() {{
+  await fetch('/auth/logout', {{method:'POST'}});
+  location.href = '/login';
+}}
+
 async function toggleNasDrain() {{
   const btn = document.getElementById('btn-nas-drain');
   const paused = btn.classList.contains('active');
@@ -2786,6 +4503,151 @@ function sizeBadge(bytes, refBytes) {{
   return `<span style="color:${{col}}">${{s}}</span> <span style="color:${{col}};font-size:10px;opacity:.8">${{sign}}${{Math.abs(pct).toFixed(0)}}%</span>`;
 }}
 
+// ── nodes tab ─────────────────────────────────────────────────────────────────
+async function loadNodes() {{
+  await Promise.all([loadCompanions(), loadFilePool(), loadQueuePlan()]);
+}}
+
+async function loadCompanions() {{
+  try {{
+    const companions = await fetch('/companions').then(r=>r.json());
+    const el = document.getElementById('nodes-list');
+    if (!companions.length) {{
+      el.innerHTML = '<div class="nodes-empty">No companion nodes registered yet</div>';
+      return;
+    }}
+    // Update pool filter options
+    const sel = document.getElementById('pool-filter-companion');
+    const existing = [...sel.options].map(o=>o.value).filter(v=>v);
+    companions.forEach(c => {{
+      if (!existing.includes(c.id)) {{
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.name || c.id.slice(0,8);
+        sel.appendChild(opt);
+      }}
+    }});
+    el.innerHTML = companions.map(c => renderNodeCard(c)).join('');
+  }} catch(e) {{ console.error('loadCompanions', e); }}
+}}
+
+function renderNodeCard(c) {{
+  const dotCls = c.online ? 'online' : 'offline';
+  const dotTitle = c.online ? 'online' : 'offline';
+  const caps = c.capabilities || {{}};
+  const encoders = caps.encoders || [];
+  const encBadges = encoders.map(e =>
+    `<span class="node-badge node-badge-enc">${{esc(e)}}</span>`
+  ).join('');
+  const workerBadge = c.is_worker
+    ? '<span class="node-badge node-badge-worker">WORKER</span>'
+    : '';
+  const disabledBadge = !c.enabled
+    ? '<span class="node-badge node-badge-disabled">DISABLED</span>'
+    : '';
+  const promoteLabel = c.is_worker ? 'DEMOTE' : 'PROMOTE TO WORKER';
+  const firstSeen = c.first_seen ? new Date(c.first_seen*1000).toLocaleDateString() : '—';
+  const lastSeen = c.last_seen ? timeAgo(c.last_seen) : '—';
+  return `<div class="node-card">
+    <div class="node-header">
+      <div class="node-dot ${{dotCls}}" title="${{dotTitle}}"></div>
+      <div class="node-name">${{esc(c.name || c.id.slice(0,8))}}</div>
+      <div class="node-platform">${{esc(c.platform || '—')}} ${{c.version ? '· v'+esc(c.version) : ''}}</div>
+    </div>
+    <div class="node-badges">
+      ${{workerBadge}}${{disabledBadge}}${{encBadges}}
+      ${{caps.ffprobe_available ? '<span class="node-badge node-badge-enc">ffprobe</span>' : ''}}
+    </div>
+    <div style="color:#555;font-size:10px">
+      first seen: ${{firstSeen}} · last seen: ${{lastSeen}}
+    </div>
+    <div class="node-actions">
+      <button class="btn-promote" onclick="promoteCompanion('${{c.id}}', ${{!c.is_worker}})">${{promoteLabel}}</button>
+    </div>
+  </div>`;
+}}
+
+async function promoteCompanion(cid, asWorker) {{
+  await fetch('/companions/'+cid+'/promote?is_worker='+asWorker, {{method:'POST'}});
+  loadCompanions();
+}}
+
+async function loadFilePool() {{
+  try {{
+    const cid = document.getElementById('pool-filter-companion').value;
+    const status = document.getElementById('pool-filter-status').value;
+    const p = new URLSearchParams();
+    if (cid) p.set('companion_id', cid);
+    if (status) p.set('status', status);
+    const rows = await fetch('/file-pool?' + p).then(r=>r.json());
+    const tbody = document.getElementById('pool-tbody');
+    if (!rows.length) {{
+      tbody.innerHTML = '<tr><td colspan="7" style="color:#444;text-align:center;padding:24px">no files in pool</td></tr>';
+      return;
+    }}
+    tbody.innerHTML = rows.slice(0,200).map(r => {{
+      const res = r.width && r.height ? r.width+'×'+r.height : '—';
+      const sc = r.status === 'excluded' ? '#555' : r.status === 'queued' ? '#80cbc4' : '#b39ddb';
+      return `<tr>
+        <td style="color:#e0e0e0;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(r.file_path)}}">${{esc(r.file_path.split(/[\\/]/).pop())}}</td>
+        <td style="color:#666;font-size:11px">${{res}}</td>
+        <td style="color:#ce93d8;font-size:11px">${{esc(r.codec||'—')}}</td>
+        <td style="color:#b39ddb">${{fmtSz(r.size)}}</td>
+        <td><span style="color:${{sc}};font-size:10px">${{r.status}}</span></td>
+        <td style="color:#555;font-size:10px">${{esc(r.companion_id.slice(0,8))}}</td>
+        <td>${{r.status === 'pending'
+          ? `<button onclick="excludeFile('${{r.id}}')" style="background:#ef9a9a22;border:1px solid #ef9a9a55;color:#ef9a9a;font-family:inherit;font-size:9px;padding:3px 10px;border-radius:6px;cursor:pointer">exclude</button>`
+          : ''}}</td>
+      </tr>`;
+    }}).join('');
+  }} catch(e) {{ console.error('loadFilePool', e); }}
+}}
+
+async function excludeFile(poolId) {{
+  await fetch('/file-pool/exclude/'+poolId, {{method:'POST'}});
+  loadFilePool();
+  loadQueuePlan();
+}}
+
+async function loadQueuePlan() {{
+  try {{
+    const rows = await fetch('/queue-plan').then(r=>r.json());
+    const tbody = document.getElementById('plan-tbody');
+    if (!rows.length) {{
+      tbody.innerHTML = '<tr><td colspan="7" style="color:#444;text-align:center;padding:24px">queue plan is empty — click BUILD QUEUE PLAN</td></tr>';
+      return;
+    }}
+    tbody.innerHTML = rows.slice(0,200).map(r => {{
+      const res = r.width && r.height ? r.width+'×'+r.height : '—';
+      return `<tr>
+        <td style="color:#555;font-size:10px">${{r.position+1}}</td>
+        <td style="color:#e0e0e0;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(r.file_path)}}">${{esc(r.file_path.split(/[\\/]/).pop())}}</td>
+        <td style="color:#666;font-size:11px">${{res}}</td>
+        <td style="color:#ce93d8;font-size:11px">${{esc(r.codec||'—')}}</td>
+        <td style="color:#b39ddb">${{fmtSz(r.size)}}</td>
+        <td style="color:#80cbc4;font-size:10px">${{esc(r.output_codec)}}</td>
+        <td style="color:#555;font-size:10px">${{esc(r.companion_id.slice(0,8))}}</td>
+      </tr>`;
+    }}).join('');
+  }} catch(e) {{ console.error('loadQueuePlan', e); }}
+}}
+
+async function buildQueuePlan() {{
+  const ok = document.getElementById('build-queue-ok');
+  await fetch('/file-pool/build-queue', {{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});
+  ok.style.opacity = 1;
+  setTimeout(() => {{ ok.style.opacity = 0; }}, 2500);
+  loadQueuePlan();
+}}
+
+function timeAgo(ts) {{
+  const s = Math.floor(Date.now()/1000 - ts);
+  if (s < 60) return s+'s ago';
+  if (s < 3600) return Math.floor(s/60)+'m ago';
+  if (s < 86400) return Math.floor(s/3600)+'h ago';
+  return Math.floor(s/86400)+'d ago';
+}}
+
 // ── init + polling ────────────────────────────────────────────────────────────
 function init() {{
   loadJobs();
@@ -2805,3 +4667,621 @@ setInterval(() => {{ if (!_openDetail) loadJobs(); }}, 15000);
 init();
 </script>
 </body></html>"""
+
+# ── companion registry ────────────────────────────────────────────────────────
+
+class CompanionRegisterReq(BaseModel):
+    name: str = ""
+    platform: str = ""
+    version: str = ""
+
+@app.post("/companions/{cid}/register")
+def companion_register(cid: str, req: CompanionRegisterReq):
+    now = time.time()
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE companion_registry SET name=?, platform=?, version=?, last_seen=? WHERE id=?",
+                (req.name, req.platform, req.version, now, cid)
+            )
+        else:
+            conn.execute("""
+                INSERT INTO companion_registry (id, name, platform, version, first_seen, last_seen)
+                VALUES (?,?,?,?,?,?)
+            """, (cid, req.name, req.platform, req.version, now, now))
+        conn.commit()
+    log.info("Companion registered: %s (%s/%s)", cid[:8], req.name, req.platform)
+    return {"ok": True}
+
+@app.get("/companions/{cid}/config")
+def companion_get_config(cid: str):
+    with db() as conn:
+        row = conn.execute("SELECT pending_config FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if not row:
+            return {"ok": True, "config": None}
+        cfg = json.loads(row["pending_config"]) if row["pending_config"] else None
+        if cfg:
+            conn.execute("UPDATE companion_registry SET pending_config=NULL WHERE id=?", (cid,))
+            conn.commit()
+    return {"ok": True, "config": cfg}
+
+class CompanionSetConfigReq(BaseModel):
+    config: dict
+
+@app.put("/companions/{cid}/config")
+def companion_set_config(cid: str, req: CompanionSetConfigReq):
+    now = time.time()
+    cfg_json = json.dumps(req.config)
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO companion_registry (id, first_seen, last_seen, pending_config) VALUES (?,?,?,?)",
+                (cid, now, now, cfg_json)
+            )
+        else:
+            conn.execute("UPDATE companion_registry SET pending_config=?, last_seen=? WHERE id=?",
+                         (cfg_json, now, cid))
+        conn.commit()
+    # Push immediately if companion is connected via WS
+    with _ws_lock:
+        conn_info = _ws_connections.get(cid)
+    if conn_info:
+        ws = conn_info["ws"]
+        async def _push():
+            try:
+                await ws.send_json({"type": "config_update", "config": req.config})
+            except Exception:
+                pass
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(_push(), loop)
+        except Exception:
+            pass
+    return {"ok": True}
+
+class CompanionCapabilitiesReq(BaseModel):
+    encoders: list = []
+    decoders: list = []
+    ffprobe_available: bool = False
+    platform: str = ""
+
+@app.post("/companions/{cid}/capabilities")
+def companion_set_capabilities(cid: str, req: CompanionCapabilitiesReq):
+    now = time.time()
+    caps_json = json.dumps(req.dict())
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO companion_registry (id, first_seen, last_seen, capabilities) VALUES (?,?,?,?)",
+                (cid, now, now, caps_json)
+            )
+        else:
+            conn.execute("UPDATE companion_registry SET capabilities=?, last_seen=? WHERE id=?",
+                         (caps_json, now, cid))
+        conn.commit()
+    return {"ok": True}
+
+@app.get("/companions")
+def list_companions():
+    now = time.time()
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM companion_registry ORDER BY last_seen DESC").fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        with _ws_lock:
+            d["online"] = r["id"] in _ws_connections
+        d["capabilities"] = json.loads(d["capabilities"]) if d["capabilities"] else None
+        d.pop("pending_config", None)  # don't expose pending config in list
+        result.append(d)
+    return result
+
+@app.post("/companions/{cid}/promote")
+def companion_promote(cid: str, is_worker: bool = True):
+    with db() as conn:
+        conn.execute("UPDATE companion_registry SET is_worker=? WHERE id=?",
+                     (1 if is_worker else 0, cid))
+        conn.commit()
+    return {"ok": True}
+
+# ── file pool endpoints ────────────────────────────────────────────────────────
+
+@app.get("/file-pool")
+def get_file_pool(companion_id: str = None, status: str = None):
+    with db() as conn:
+        query = "SELECT * FROM file_pool"
+        params = []
+        conditions = []
+        if companion_id:
+            conditions.append("companion_id=?")
+            params.append(companion_id)
+        if status:
+            conditions.append("status=?")
+            params.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY discovered_at DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+@app.post("/file-pool/exclude/{pool_id}")
+def exclude_from_pool(pool_id: str):
+    with db() as conn:
+        conn.execute("UPDATE file_pool SET status='excluded' WHERE id=?", (pool_id,))
+        conn.execute("DELETE FROM queue_plan WHERE file_pool_id=? AND status='pending'", (pool_id,))
+        conn.commit()
+    return {"ok": True}
+
+@app.get("/queue-plan")
+def get_queue_plan():
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT qp.*, fp.file_path, fp.codec, fp.size, fp.duration, fp.width, fp.height
+            FROM queue_plan qp
+            JOIN file_pool fp ON fp.id = qp.file_pool_id
+            WHERE qp.status='pending'
+            ORDER BY qp.position
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+class ReorderReq(BaseModel):
+    ids: list  # list of queue_plan ids in desired order
+
+@app.post("/queue-plan/reorder")
+def reorder_queue_plan(req: ReorderReq):
+    with db() as conn:
+        for pos, plan_id in enumerate(req.ids):
+            conn.execute("UPDATE queue_plan SET position=? WHERE id=? AND status='pending'",
+                         (pos, plan_id))
+        conn.commit()
+    return {"ok": True}
+
+class BuildQueueReq(BaseModel):
+    min_size_mb: int = None
+    min_height: int = None
+    min_bitrate_kbps: int = None
+    skip_av1: bool = None
+    skip_hevc: bool = None
+    output_codec: str = "av1"
+
+@app.post("/file-pool/build-queue")
+def build_queue_plan_endpoint(req: BuildQueueReq = None):
+    req = req or BuildQueueReq()
+    count = _build_queue_plan(req)
+    return {"ok": True, "queued": count}
+
+def _build_queue_plan(req=None):
+    """Build queue_plan from file_pool with weighted fair mixing."""
+    min_size = (req.min_size_mb if req and req.min_size_mb is not None
+                else int(_get_setting("min_size_mb", "0"))) * 1_000_000
+    min_height = (req.min_height if req and req.min_height is not None
+                  else int(_get_setting("min_height", "0")))
+    min_bitrate = (req.min_bitrate_kbps if req and req.min_bitrate_kbps is not None
+                   else int(_get_setting("min_bitrate_kbps", "0"))) * 1000
+    skip_av1 = (req.skip_av1 if req and req.skip_av1 is not None
+                else _get_setting("skip_av1", "true") == "true")
+    skip_hevc = (req.skip_hevc if req and req.skip_hevc is not None
+                 else _get_setting("skip_hevc", "true") == "true")
+    output_codec = (req.output_codec if req and req.output_codec else "av1")
+
+    now = time.time()
+    with db() as conn:
+        # Get all pending pool entries per companion
+        rows = conn.execute("""
+            SELECT f.* FROM file_pool f
+            JOIN companion_registry r ON r.id=f.companion_id
+            WHERE f.status='pending' AND r.enabled=1
+            ORDER BY f.size DESC
+        """).fetchall()
+
+        # Apply filters
+        filtered = []
+        for r in rows:
+            if min_size and r["size"] < min_size:
+                continue
+            if min_height and r["height"] and r["height"] < min_height:
+                continue
+            if min_bitrate and r["bitrate"] and r["bitrate"] < min_bitrate:
+                continue
+            if skip_av1 and r["codec"] == "av1":
+                continue
+            if skip_hevc and r["codec"] in ("hevc", "h265"):
+                continue
+            filtered.append(r)
+
+        if not filtered:
+            return 0
+
+        # Get companion weights from client table (by companion name) or default 5
+        weight_rows = conn.execute("SELECT name, weight FROM clients").fetchall()
+        weights_by_name = {r["name"]: max(1, r["weight"] or 5) for r in weight_rows}
+
+        # Group by companion_id
+        by_companion: dict = {}
+        for r in filtered:
+            cid = r["companion_id"]
+            if cid not in by_companion:
+                cconn = conn.execute("SELECT name FROM companion_registry WHERE id=?", (cid,)).fetchone()
+                cname = cconn["name"] if cconn else cid[:8]
+                by_companion[cid] = {"name": cname, "files": [], "weight": weights_by_name.get(cname, 5)}
+            by_companion[cid]["files"].append(r)
+
+        # Weighted round-robin interleave
+        total_weight = sum(c["weight"] for c in by_companion.values())
+        interleaved = []
+        companions = list(by_companion.values())
+        indices = {c["name"]: 0 for c in companions}
+        # Repeat until all files are placed
+        while any(indices[c["name"]] < len(c["files"]) for c in companions):
+            for comp in companions:
+                slots = max(1, round(len(filtered) * comp["weight"] / total_weight))
+                placed = 0
+                while placed < slots and indices[comp["name"]] < len(comp["files"]):
+                    idx = indices[comp["name"]]
+                    interleaved.append(comp["files"][idx])
+                    indices[comp["name"]] += 1
+                    placed += 1
+
+        # Clear old pending plan and insert new
+        conn.execute("DELETE FROM queue_plan WHERE status='pending'")
+        for pos, f in enumerate(interleaved):
+            plan_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO queue_plan (id, position, file_pool_id, companion_id, output_codec, created_at)
+                VALUES (?,?,?,?,?,?)
+            """, (plan_id, pos, f["id"], f["companion_id"], output_codec, now))
+        conn.commit()
+
+    log.info("Queue plan built: %d items from %d companions", len(interleaved), len(by_companion))
+    return len(interleaved)
+
+# ── WebSocket push helper ──────────────────────────────────────────────────────
+
+def _ws_push(cid: str, message: dict):
+    """Push a JSON message to a connected companion/worker (fire-and-forget)."""
+    with _ws_lock:
+        conn_info = _ws_connections.get(cid)
+    if not conn_info:
+        return False
+    ws = conn_info["ws"]
+    async def _send():
+        try:
+            await ws.send_json(message)
+        except Exception as e:
+            log.debug("WS push error to %s: %s", cid, e)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+            return True
+    except Exception:
+        pass
+    return False
+
+# ── WebSocket endpoint ────────────────────────────────────────────────────────
+
+@app.websocket("/ws/{kind}/{cid}")
+async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
+    # Auth check
+    if AUTH_ENABLED:
+        expected = AUTH_COMPANION_TOKEN if kind == "companion" else AUTH_WORKER_TOKEN
+        if expected and not hmac.compare_digest(token, expected):
+            await ws.close(code=4401)
+            return
+
+    await ws.accept()
+
+    # Register connection
+    with _ws_lock:
+        _ws_connections[cid] = {"ws": ws, "kind": kind, "name": cid}
+
+    now = time.time()
+
+    # Fetch and send pending config
+    pending_cfg = None
+    with db() as conn:
+        row = conn.execute("SELECT pending_config FROM companion_registry WHERE id=?", (cid,)).fetchone()
+        if row and row["pending_config"]:
+            pending_cfg = json.loads(row["pending_config"])
+            conn.execute("UPDATE companion_registry SET pending_config=NULL, last_seen=? WHERE id=?", (now, cid))
+            conn.commit()
+
+    ctrl = _control.get("command", "run")
+    await ws.send_json({"type": "welcome", "pending_config": pending_cfg, "control": ctrl})
+
+    try:
+        while True:
+            data = await ws.receive_json()
+            msg_type = data.get("type", "")
+            now = time.time()
+
+            if msg_type == "hello":
+                name = data.get("name", "")
+                platform = data.get("platform", "")
+                version = data.get("version", "")
+                caps = data.get("capabilities", {})
+                with _ws_lock:
+                    _ws_connections[cid]["name"] = name
+                with db() as conn:
+                    existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
+                    if existing:
+                        conn.execute("""
+                            UPDATE companion_registry SET name=?, platform=?, version=?,
+                            capabilities=?, last_seen=? WHERE id=?
+                        """, (name, platform, version, json.dumps(caps), now, cid))
+                    else:
+                        conn.execute("""
+                            INSERT INTO companion_registry
+                            (id, name, platform, version, capabilities, first_seen, last_seen)
+                            VALUES (?,?,?,?,?,?,?)
+                        """, (cid, name, platform, version, json.dumps(caps), now, now))
+                    conn.commit()
+                log.info("WS hello: %s (%s %s)", name, kind, platform)
+
+            elif msg_type == "file_list":
+                files = data.get("files", [])
+                with db() as conn:
+                    for f in files:
+                        fp_id = str(uuid.uuid4())
+                        try:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO file_pool
+                                (id, companion_id, file_path, size, codec, duration,
+                                 width, height, fps, bitrate, discovered_at, status)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,
+                                    COALESCE((SELECT status FROM file_pool WHERE companion_id=? AND file_path=?), 'pending'))
+                            """, (fp_id, cid, f.get("path", ""), f.get("size", 0),
+                                  f.get("codec", ""), f.get("duration", 0.0),
+                                  f.get("width", 0), f.get("height", 0),
+                                  f.get("fps", 0.0), f.get("bitrate", 0),
+                                  now, cid, f.get("path", "")))
+                        except Exception as e:
+                            log.warning("file_pool insert error: %s", e)
+                    conn.commit()
+                log.info("File list from %s: %d files", cid[:8], len(files))
+                # Auto-rebuild queue plan
+                threading.Thread(target=_build_queue_plan, daemon=True).start()
+
+            elif msg_type == "heartbeat":
+                await ws.send_json({"type": "pong"})
+                with db() as conn:
+                    conn.execute("UPDATE companion_registry SET last_seen=? WHERE id=?", (now, cid))
+                    conn.commit()
+
+            elif msg_type == "progress" and kind == "worker":
+                job_id = data.get("job_id", "")
+                if job_id:
+                    fname = ""
+                    with db() as conn:
+                        row = conn.execute("SELECT source_path FROM jobs WHERE id=?", (job_id,)).fetchone()
+                        fname = Path(row["source_path"]).name if row else ""
+                        conn.execute(
+                            "UPDATE jobs SET percent=?, fps=?, speed=?, updated_at=? WHERE id=?",
+                            (data.get("percent", 0), data.get("fps", 0), data.get("speed", ""), now, job_id)
+                        )
+                        conn.commit()
+                    _live[job_id] = {
+                        "worker": cid, "phase": "encoding",
+                        "percent": data.get("percent", 0), "fps": data.get("fps", 0),
+                        "speed": data.get("speed", ""), "frame": data.get("frame", 0),
+                        "bitrate": data.get("bitrate", ""), "out_time": data.get("out_time", ""),
+                        "file": fname, "updated_at": now,
+                    }
+                    _worker_update(cid, "encoding", job_id, fname)
+
+            elif msg_type == "done" and kind == "worker":
+                job_id = data.get("job_id", "")
+                output_size = data.get("output_size", 0)
+                if job_id:
+                    with db() as conn:
+                        row = conn.execute(
+                            "SELECT source_duration_secs, output_path, source_meta FROM jobs WHERE id=?",
+                            (job_id,)
+                        ).fetchone()
+                        conn.execute(
+                            "UPDATE jobs SET status='done', output_size=?, updated_at=? WHERE id=?",
+                            (output_size, now, job_id)
+                        )
+                        conn.commit()
+                    if row:
+                        _run_verification(job_id, row["output_path"], row["source_duration_secs"], row["source_meta"] or "{}")
+                    _live.pop(job_id, None)
+                    _worker_update(cid, "idle")
+                    log.info("WS done: job=%s size=%d", job_id, output_size)
+
+            elif msg_type == "failed" and kind == "worker":
+                job_id = data.get("job_id", "")
+                error = data.get("error", "")
+                if job_id:
+                    with db() as conn:
+                        conn.execute(
+                            "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
+                            (error[:2000], now, job_id)
+                        )
+                        conn.commit()
+                    _live.pop(job_id, None)
+                    _worker_update(cid, "idle")
+                    log.warning("WS failed: job=%s error=%s", job_id, error[:200])
+
+    except WebSocketDisconnect:
+        log.info("WS disconnect: %s (%s)", cid[:8], kind)
+    except Exception as e:
+        log.warning("WS error for %s: %s", cid[:8], e)
+    finally:
+        with _ws_lock:
+            _ws_connections.pop(cid, None)
+        with db() as conn:
+            conn.execute("UPDATE companion_registry SET last_seen=? WHERE id=?", (time.time(), cid))
+            conn.commit()
+
+# ── CLI auth recovery ─────────────────────────────────────────────────────────
+
+def _cli_get_user(conn, username: str):
+    return conn.execute("SELECT * FROM auth_users WHERE username=?", (username,)).fetchone()
+
+def _cli_create_user(args) -> int:
+    now = _now()
+    with db() as conn:
+        if _cli_get_user(conn, args.username):
+            print(f"user already exists: {args.username}", file=sys.stderr)
+            return 2
+        user_id = str(uuid.uuid4())
+        conn.execute("""
+            INSERT INTO auth_users
+                (id, username, display_name, email, role, source, enabled, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (
+            user_id,
+            args.username,
+            args.display_name or args.username,
+            args.email,
+            args.role,
+            "local",
+            1,
+            now,
+            now,
+        ))
+        token = _create_invite(conn, user_id, args.minutes * 60)
+    print(f"created user: {args.username}")
+    print(f"setup URL: {_setup_url(token)}")
+    return 0
+
+def _cli_invite(args) -> int:
+    with db() as conn:
+        user = _cli_get_user(conn, args.username)
+        if not user:
+            print(f"unknown user: {args.username}", file=sys.stderr)
+            return 2
+        token = _create_invite(conn, user["id"], args.minutes * 60)
+    print(f"setup URL: {_setup_url(token)}")
+    return 0
+
+def _cli_list_users(_args) -> int:
+    with db() as conn:
+        users = conn.execute("""
+            SELECT u.*, COUNT(p.id) AS passkeys
+            FROM auth_users u
+            LEFT JOIN auth_passkeys p ON p.user_id=u.id
+            GROUP BY u.id
+            ORDER BY u.created_at
+        """).fetchall()
+    if not users:
+        print("no users")
+        return 0
+    for u in users:
+        state = "enabled" if u["enabled"] else "disabled"
+        email = u["email"] or "-"
+        print(f"{u['username']}\t{state}\t{u['role']}\t{u['source']}\tpasskeys={u['passkeys']}\t{email}")
+    return 0
+
+def _cli_set_enabled(args, enabled: bool) -> int:
+    with db() as conn:
+        user = _cli_get_user(conn, args.username)
+        if not user:
+            print(f"unknown user: {args.username}", file=sys.stderr)
+            return 2
+        conn.execute("UPDATE auth_users SET enabled=?, updated_at=? WHERE id=?",
+                     (1 if enabled else 0, _now(), user["id"]))
+        if not enabled:
+            conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user["id"],))
+        conn.commit()
+    print(f"{'enabled' if enabled else 'disabled'} user: {args.username}")
+    return 0
+
+def _cli_reset_passkeys(args) -> int:
+    with db() as conn:
+        user = _cli_get_user(conn, args.username)
+        if not user:
+            print(f"unknown user: {args.username}", file=sys.stderr)
+            return 2
+        conn.execute("DELETE FROM auth_passkeys WHERE user_id=?", (user["id"],))
+        conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user["id"],))
+        token = _create_invite(conn, user["id"], args.minutes * 60)
+    print(f"reset passkeys for: {args.username}")
+    print(f"setup URL: {_setup_url(token)}")
+    return 0
+
+def _cli_revoke_sessions(args) -> int:
+    with db() as conn:
+        user = _cli_get_user(conn, args.username)
+        if not user:
+            print(f"unknown user: {args.username}", file=sys.stderr)
+            return 2
+        conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user["id"],))
+        conn.commit()
+    print(f"revoked sessions for: {args.username}")
+    return 0
+
+def _cli_auth_status(_args) -> int:
+    print(f"AUTH_ENABLED={str(AUTH_ENABLED).lower()}")
+    print(f"AUTH_PUBLIC_ORIGIN={AUTH_PUBLIC_ORIGIN or '(derived from request)'}")
+    print(f"AUTH_RP_ID={AUTH_RP_ID or '(derived from request host)'}")
+    print(f"AUTHENTIK_ENABLED={str(AUTHENTIK_ENABLED).lower()}")
+    print(f"JELLYFIN_ENABLED={str(JELLYFIN_ENABLED).lower()}")
+    print(f"JELLYFIN_URL={JELLYFIN_URL or '(unset)'}")
+    print(f"AUTH_WORKER_TOKEN={'set' if AUTH_WORKER_TOKEN else 'unset'}")
+    print(f"AUTH_COMPANION_TOKEN={'set' if AUTH_COMPANION_TOKEN else 'unset'}")
+    print(f"AUTH_LEGACY_MACHINE_ACCESS={str(AUTH_LEGACY_MACHINE_ACCESS).lower()}")
+    return 0
+
+def _build_cli_parser():
+    parser = argparse.ArgumentParser(description="Yulia AV1 queue utilities")
+    sub = parser.add_subparsers(dest="area")
+
+    auth = sub.add_parser("auth", help="manage passkey-first local auth")
+    auth_sub = auth.add_subparsers(dest="cmd")
+
+    create = auth_sub.add_parser("create-user", help="create a local user and print a setup URL")
+    create.add_argument("username")
+    create.add_argument("--display-name")
+    create.add_argument("--email")
+    create.add_argument("--role", default="operator", choices=["admin", "operator", "viewer"])
+    create.add_argument("--minutes", type=int, default=1440)
+    create.set_defaults(func=_cli_create_user)
+
+    invite = auth_sub.add_parser("invite", help="print a one-time passkey setup URL")
+    invite.add_argument("username")
+    invite.add_argument("--minutes", type=int, default=1440)
+    invite.set_defaults(func=_cli_invite)
+
+    list_users = auth_sub.add_parser("list-users", help="list users and passkey counts")
+    list_users.set_defaults(func=_cli_list_users)
+
+    disable = auth_sub.add_parser("disable-user", help="disable a user and revoke sessions")
+    disable.add_argument("username")
+    disable.set_defaults(func=lambda args: _cli_set_enabled(args, False))
+
+    enable = auth_sub.add_parser("enable-user", help="enable a user")
+    enable.add_argument("username")
+    enable.set_defaults(func=lambda args: _cli_set_enabled(args, True))
+
+    reset = auth_sub.add_parser("reset-passkeys", help="delete passkeys, revoke sessions, and print setup URL")
+    reset.add_argument("username")
+    reset.add_argument("--minutes", type=int, default=1440)
+    reset.set_defaults(func=_cli_reset_passkeys)
+
+    revoke = auth_sub.add_parser("revoke-sessions", help="log a user out everywhere")
+    revoke.add_argument("username")
+    revoke.set_defaults(func=_cli_revoke_sessions)
+
+    status_cmd = auth_sub.add_parser("status", help="print auth configuration status")
+    status_cmd.set_defaults(func=_cli_auth_status)
+    return parser
+
+def main_cli(argv: list[str] | None = None) -> int:
+    parser = _build_cli_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "area", None):
+        parser.print_help()
+        return 2
+    if not getattr(args, "cmd", None):
+        parser.parse_args([args.area, "--help"])
+        return 2
+    return args.func(args)
+
+if __name__ == "__main__":
+    raise SystemExit(main_cli())

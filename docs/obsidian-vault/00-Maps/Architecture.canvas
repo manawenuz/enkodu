@@ -1,0 +1,112 @@
+{
+  "nodes": [
+    {
+      "id": "home",
+      "type": "file",
+      "file": "Home.md",
+      "x": -60,
+      "y": -360,
+      "width": 260,
+      "height": 120
+    },
+    {
+      "id": "overview",
+      "type": "file",
+      "file": "01-Architecture/System Overview.md",
+      "x": -420,
+      "y": -120,
+      "width": 280,
+      "height": 150
+    },
+    {
+      "id": "queue",
+      "type": "text",
+      "text": "# Queue service\nFastAPI + SQLite\nNAS scan, dispatch, dashboard, uploads",
+      "x": -60,
+      "y": -120,
+      "width": 300,
+      "height": 160
+    },
+    {
+      "id": "worker",
+      "type": "file",
+      "file": "02-Flows/Worker Transcode Flow.md",
+      "x": 340,
+      "y": -120,
+      "width": 300,
+      "height": 160
+    },
+    {
+      "id": "companion",
+      "type": "file",
+      "file": "02-Flows/Companion Upload Flow.md",
+      "x": -60,
+      "y": 140,
+      "width": 300,
+      "height": 160
+    },
+    {
+      "id": "safety",
+      "type": "file",
+      "file": "02-Flows/Verification and Safety Flow.md",
+      "x": 340,
+      "y": 140,
+      "width": 300,
+      "height": 160
+    },
+    {
+      "id": "release",
+      "type": "file",
+      "file": "05-Product/Limited Release Checklist.md",
+      "x": -420,
+      "y": 140,
+      "width": 280,
+      "height": 160
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "fromNode": "home",
+      "fromSide": "bottom",
+      "toNode": "overview",
+      "toSide": "top"
+    },
+    {
+      "id": "e2",
+      "fromNode": "overview",
+      "fromSide": "right",
+      "toNode": "queue",
+      "toSide": "left"
+    },
+    {
+      "id": "e3",
+      "fromNode": "queue",
+      "fromSide": "right",
+      "toNode": "worker",
+      "toSide": "left"
+    },
+    {
+      "id": "e4",
+      "fromNode": "companion",
+      "fromSide": "right",
+      "toNode": "safety",
+      "toSide": "left"
+    },
+    {
+      "id": "e5",
+      "fromNode": "release",
+      "fromSide": "right",
+      "toNode": "safety",
+      "toSide": "left"
+    },
+    {
+      "id": "e6",
+      "fromNode": "queue",
+      "fromSide": "bottom",
+      "toNode": "companion",
+      "toSide": "top"
+    }
+  ]
+}
+

@@ -54,10 +54,15 @@ if (-not (Test-Path $OutputDir)) {
 }
 
 # Copy the binary
-$SourcePath = "target\$TargetDir\$($Target.Replace('-', '\'))\$BinName.exe"
+# When building with --target, cargo puts the binary in target/<target>/<profile>/
+$SourcePath = "target\$Target\$TargetDir\$BinName.exe"
 if (-not (Test-Path $SourcePath)) {
-    Write-Error "Binary not found at: $SourcePath"
-    exit 1
+    # Fallback: some builds without --target put it in target/<profile>/
+    $SourcePath = "target\$TargetDir\$BinName.exe"
+    if (-not (Test-Path $SourcePath)) {
+        Write-Error "Binary not found at: $SourcePath"
+        exit 1
+    }
 }
 
 Copy-Item $SourcePath "$OutputDir\$BinName.exe" -Force

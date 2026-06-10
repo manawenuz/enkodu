@@ -1,16 +1,15 @@
 //! macOS-specific platform adapter.
 
-use anyhow::Result;
-use log::info;
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::Arc;
 use crate::config::Config;
 use crate::core::ServerState;
 use crate::platform::{Platform, SingleInstanceGuard};
+use anyhow::Result;
+use log::info;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[cfg(unix)]
-use crate::ipc::{send_cmd as unix_send_cmd, start_server as unix_start_server, SOCK_PATH};
+use crate::ipc::{send_cmd as unix_send_cmd, start_server as unix_start_server};
 
 /// macOS platform implementation.
 pub struct MacPlatform;
@@ -171,8 +170,8 @@ fn toggle_launch_agent(enabled: bool) -> Result<()> {
         if path.exists() {
             return Ok(());
         }
-        let exe = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/enkodu"));
+        let exe =
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/enkodu"));
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -17,7 +17,7 @@ pub fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
         thread::sleep(Duration::from_secs(5));
 
         // Poll queue status
-        match api::queue_status(&cfg.server_url) {
+        match api::queue_status(&cfg.server_url, cfg.auth_token.as_deref()) {
             Ok(s) => {
                 let prev = state.read().unwrap().prev_done;
                 if s.done > prev && prev > 0 {
@@ -47,7 +47,7 @@ pub fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
         }
 
         // Poll live jobs for active encoding info
-        if let Ok(live) = api::live_jobs(&cfg.server_url) {
+        if let Ok(live) = api::live_jobs(&cfg.server_url, cfg.auth_token.as_deref()) {
             let mut st = state.write().unwrap();
             if let Some(job) = live.values().next() {
                 st.encoding_file = Some(job.file.clone());
@@ -63,13 +63,16 @@ pub fn poll_loop(cfg: Config, state: Arc<RwLock<ServerState>>) {
         }
 
         // Poll control status
-        if let Ok(cmd) = api::control_status(&cfg.server_url) {
+        if let Ok(cmd) = api::control_status(&cfg.server_url, cfg.auth_token.as_deref()) {
             state.write().unwrap().control_cmd = cmd;
         }
 
         // Poll NAS drain setting from server
-        if let Ok(settings) = api::get_settings(&cfg.server_url) {
-            let nas_drain = settings.get("nas_drain").map(|v| v == "true").unwrap_or(false);
+        if let Ok(settings) = api::get_settings(&cfg.server_url, cfg.auth_token.as_deref()) {
+            let nas_drain = settings
+                .get("nas_drain")
+                .map(|v| v == "true")
+                .unwrap_or(false);
             state.write().unwrap().nas_drain = nas_drain;
         }
     }

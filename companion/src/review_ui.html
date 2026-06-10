@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>인코두 ENKODU</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0D0D14;--surface:#141420;--surface2:#1A1A2E;--border:#2A2A40;
+  --accent:#4169E1;--accent-dim:rgba(65,105,225,.25);
+  --pass:#00E070;--fail:#FF4040;--warn:#FFB340;
+  --text:#E8E8F0;--muted:#6B6B8A;
+  --mono:'JetBrains Mono','Fira Code','Cascadia Code','Consolas',monospace;
+}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh}
+
+/* ── Header ── */
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.brand{display:flex;flex-direction:column;gap:2px}
+.brand-en{font-size:20px;font-weight:800;letter-spacing:4px;color:var(--accent)}
+.brand-ko{font-size:10px;color:var(--muted);letter-spacing:2px;font-family:var(--mono)}
+#server-tag{font-size:11px;color:var(--muted);font-family:var(--mono)}
+
+/* ── Tabs ── */
+.tabs{display:flex;background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px}
+.tab{padding:12px 20px;cursor:pointer;color:var(--muted);font-size:11px;letter-spacing:2px;border-bottom:2px solid transparent;transition:all .15s;text-transform:uppercase;user-select:none}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover:not(.active){color:var(--text)}
+.badge{background:var(--accent);color:#fff;font-size:10px;padding:1px 6px;border-radius:99px;margin-left:6px;vertical-align:middle}
+
+/* ── Main ── */
+.main{padding:24px;max-width:1440px;margin:0 auto}
+
+/* ── Bulk bar ── */
+.bulk-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:20px}
+.bulk-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-right:auto}
+
+/* ── Cards ── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:16px;overflow:hidden;transition:border-color .15s}
+.card:hover{border-color:#3d3d60}
+.card.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-dim)}
+
+.card-header{display:flex;align-items:center;gap:10px;padding:12px 16px;background:var(--surface2);border-bottom:1px solid var(--border)}
+.card-header input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer;flex-shrink:0}
+.card-filename{font-family:var(--mono);font-size:13px;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}
+.pill-pass{background:rgba(0,224,112,.12);color:var(--pass);border:1px solid rgba(0,224,112,.25)}
+.pill-fail{background:rgba(255,64,64,.12);color:var(--fail);border:1px solid rgba(255,64,64,.25)}
+.card-ts{color:var(--muted);font-size:11px;font-family:var(--mono);white-space:nowrap}
+
+/* ── Stats grid ── */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr}
+.stats-col{padding:14px 20px}
+.stats-col+.stats-col{border-left:1px solid var(--border)}
+.col-label{font-size:9px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:10px;font-family:var(--mono)}
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;font-size:12px}
+.sk{color:var(--muted)}
+.sv{font-family:var(--mono);font-size:11px}
+.sv.hi{color:var(--pass);font-weight:700}
+.savings{color:var(--pass);margin-left:4px}
+.play-btn{display:inline-flex;align-items:center;gap:5px;margin-top:10px;padding:5px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;cursor:pointer;font-size:11px;color:var(--muted);transition:all .15s;user-select:none}
+.play-btn:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ── Encode meta ── */
+.encode-meta{display:flex;flex-wrap:wrap;gap:18px;padding:10px 20px;border-top:1px solid var(--border);font-size:11px;color:var(--muted);font-family:var(--mono)}
+.encode-meta .v{color:var(--text)}
+
+/* ── Actions ── */
+.card-actions{display:flex;gap:8px;padding:12px 20px;border-top:1px solid var(--border);background:var(--surface2);align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+
+/* ── Buttons ── */
+.btn{padding:6px 14px;border-radius:5px;cursor:pointer;font-size:12px;border:1px solid;transition:all .15s;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;user-select:none}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-ghost{background:transparent;border-color:var(--border);color:var(--text)}
+.btn-ghost:hover:not(:disabled){border-color:var(--muted)}
+.btn-accept{background:var(--accent-dim);border-color:rgba(65,105,225,.5);color:var(--accent)}
+.btn-accept:hover:not(:disabled){background:rgba(65,105,225,.35);border-color:var(--accent)}
+.btn-reject{background:transparent;border-color:rgba(255,64,64,.35);color:var(--fail)}
+.btn-reject:hover:not(:disabled){background:rgba(255,64,64,.1);border-color:var(--fail)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover:not(:disabled){background:#3558cc}
+.btn-danger{background:rgba(255,64,64,.15);border-color:var(--fail);color:var(--fail)}
+.btn-danger:hover{background:rgba(255,64,64,.25)}
+
+select.sel{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:5px;font-size:12px;cursor:pointer}
+select.sel:focus{outline:none;border-color:var(--accent)}
+
+/* ── Settings ── */
+.settings-wrap{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.settings-section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px}
+.sec-title{font-size:9px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin-bottom:14px;font-family:var(--mono)}
+.field{margin-bottom:12px}
+.field>label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px;letter-spacing:.3px}
+.field input[type=text],.field input[type=password],.field input[type=number],.field select,.field textarea{
+  width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  padding:7px 10px;border-radius:5px;font-size:12px;font-family:var(--mono)}
+.field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:var(--accent)}
+.field textarea{resize:vertical}
+.field-row{display:flex;align-items:center;gap:8px}
+.field-row input[type=checkbox]{accent-color:var(--accent);width:14px;height:14px}
+.field-row label{font-size:12px;color:var(--text);cursor:pointer}
+.save-bar{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+.hint{font-size:10px;color:var(--muted);margin-top:12px;line-height:1.5}
+
+/* ── Modal ── */
+.backdrop{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:300;display:flex;align-items:center;justify-content:center}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;min-width:360px;max-width:480px}
+.modal h3{font-size:15px;margin-bottom:10px}
+.modal p{color:var(--muted);font-size:12px;line-height:1.6;margin-bottom:20px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+
+/* ── Empty ── */
+.empty{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty-icon{font-size:40px;margin-bottom:14px;opacity:.5}
+.empty h2{font-size:16px;color:var(--text);margin-bottom:6px}
+.empty p{font-size:12px}
+
+/* ── Toast ── */
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 18px;border-radius:8px;font-size:12px;opacity:0;transition:opacity .25s;z-index:400;pointer-events:none}
+.toast.pass{border-color:var(--pass);color:var(--pass)}
+.toast.fail{border-color:var(--fail);color:var(--fail)}
+.toast.show{opacity:1}
+
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div class="brand-en">ENKODU</div>
+    <div class="brand-ko">인코두 · AV1 변환 검토</div>
+  </div>
+  <span id="server-tag"></span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="review">
+    Review <span class="badge" id="badge-count">0</span>
+  </div>
+  <div class="tab" data-tab="settings">Settings</div>
+</div>
+
+<!-- ══ REVIEW TAB ══ -->
+<div id="tab-review" class="main">
+  <div class="bulk-bar">
+    <span class="bulk-label" id="bulk-label">Pending review</span>
+    <button class="btn btn-ghost" onclick="selAll()">All</button>
+    <button class="btn btn-ghost" onclick="selNone()">None</button>
+    <select class="sel" id="bulk-action">
+      <option value="keep">Keep original</option>
+      <option value="rename">Rename original (.bak)</option>
+      <option value="replace">Replace original ⚠</option>
+    </select>
+    <button class="btn btn-accept" onclick="doBulkAccept()">✓ Accept Selected</button>
+    <button class="btn btn-reject" onclick="doBulkReject()">✗ Reject Selected</button>
+  </div>
+  <div id="jobs"></div>
+</div>
+
+<!-- ══ SETTINGS TAB ══ -->
+<div id="tab-settings" class="main hidden">
+  <div class="settings-wrap">
+
+    <div class="settings-section">
+      <div class="sec-title">연결 / Connection</div>
+      <div class="field">
+        <label>Server URL</label>
+        <input type="text" id="s-url" placeholder="http://192.168.1.x:8090">
+      </div>
+      <div class="field">
+        <label>Auth Token <span style="color:var(--muted)">(companion bearer token)</span></label>
+        <input type="password" id="s-token" placeholder="leave blank if auth disabled">
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="sec-title">동작 / Behavior</div>
+      <div class="field">
+        <label>Review Mode</label>
+        <select id="s-review-mode">
+          <option value="auto">Auto — apply on_success immediately after verify</option>
+          <option value="manual">Manual — hold for review in this UI</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>On Success <span style="color:var(--muted)">(auto mode)</span></label>
+        <select id="s-on-success">
+          <option value="rename">Rename original (append .bak suffix)</option>
+          <option value="keep">Keep original untouched</option>
+          <option value="replace">Replace original (destructive)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Backup Suffix</label>
+        <input type="text" id="s-suffix" value=".bak">
+      </div>
+      <div class="field">
+        <label>Mode</label>
+        <select id="s-mode">
+          <option value="interactive">Interactive</option>
+          <option value="batch">Batch</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-row">
+          <input type="checkbox" id="s-skip-av1">
+          <label for="s-skip-av1">Skip files already AV1</label>
+        </div>
+      </div>
+      <div class="field">
+        <label>Min Duration (seconds)</label>
+        <input type="number" id="s-min-dur" min="0">
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="sec-title">스캔 / Scan</div>
+      <div class="field">
+        <label>Directories (one per line)</label>
+        <textarea id="s-dirs" rows="5" placeholder="~/Movies&#10;~/Downloads"></textarea>
+      </div>
+      <div class="field">
+        <label>Extensions (comma-separated)</label>
+        <input type="text" id="s-exts" placeholder="mp4,mov,mkv,avi,m4v,ts">
+      </div>
+    </div>
+
+  </div>
+  <div class="save-bar">
+    <button class="btn btn-ghost" onclick="loadSettings()">↺ Reset</button>
+    <button class="btn btn-primary" onclick="saveSettings()">Save & Apply</button>
+  </div>
+  <p class="hint">
+    * Settings are saved to config.toml immediately and applied to new jobs right away.
+    Server URL and auth token changes require a companion restart to take full effect.
+  </p>
+</div>
+
+<!-- ══ Reject modal ══ -->
+<div id="modal" class="backdrop hidden">
+  <div class="modal">
+    <h3>거부 확인 / Confirm Reject</h3>
+    <p>This job will be moved out of review. Do you also want to delete the AV1 output file from disk?<br>
+    Original source file is always left untouched.</p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-ghost" onclick="doReject(false)">Keep output file</button>
+      <button class="btn btn-danger" onclick="doReject(true)">Delete output file</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ══ State ══════════════════════════════════════════════════════════════════════
+let jobs = [];
+let pendingRejectIds = null;
+
+// ══ Tab switching ══════════════════════════════════════════════════════════════
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  const name = t.dataset.tab;
+  document.getElementById('tab-review').classList.toggle('hidden', name !== 'review');
+  document.getElementById('tab-settings').classList.toggle('hidden', name !== 'settings');
+  if (name === 'settings') loadSettings();
+}));
+
+// ══ Utils ═══════════════════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+
+function fmt_bytes(b) {
+  if (b == null) return '—';
+  if (b > 1e9)  return (b/1e9).toFixed(2)+' GB';
+  if (b > 1e6)  return (b/1e6).toFixed(1)+' MB';
+  if (b > 1e3)  return (b/1e3).toFixed(0)+' KB';
+  return b+' B';
+}
+function fmt_kbps(k) {
+  if (k == null) return '—';
+  return k > 1000 ? (k/1000).toFixed(1)+' Mbps' : k+' kbps';
+}
+function fmt_dur(s) {
+  if (s == null) return '—';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = Math.floor(s%60);
+  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
+  return `${m}:${pad(sec)}`;
+}
+function fmt_ts(t) {
+  if (!t) return '—';
+  return new Date(t*1000).toLocaleString(undefined,{dateStyle:'short',timeStyle:'medium'});
+}
+function fmt_enc(s) {
+  if (!s) return '—';
+  if (s < 60) return s+'s';
+  const m = Math.floor(s/60), r = s%60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+function pad(n) { return String(n).padStart(2,'0'); }
+function pct(a, b) {
+  if (!a || !b) return null;
+  return Math.round((1 - b/a)*100);
+}
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function toast(msg, type='pass') {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = `toast ${type} show`;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2800);
+}
+async function api(path, method='GET', body=null) {
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (body !== null) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts).catch(() => null);
+  if (!r) throw new Error('Network error');
+  return r;
+}
+
+// ══ Jobs ════════════════════════════════════════════════════════════════════════
+async function loadJobs() {
+  const r = await api('/api/jobs').catch(() => null);
+  if (!r || !r.ok) return;
+  jobs = await r.json();
+  $('badge-count').textContent = jobs.length;
+  renderJobs();
+}
+
+function renderJobs() {
+  const container = $('jobs');
+  if (!jobs.length) {
+    container.innerHTML = `<div class="empty">
+      <div class="empty-icon">✓</div>
+      <h2>모두 검토 완료</h2>
+      <p>No jobs pending review. New jobs will appear here after encoding completes.</p>
+    </div>`;
+    $('bulk-label').textContent = 'No pending jobs';
+    return;
+  }
+  const n = jobs.length;
+  $('bulk-label').textContent = `${n} job${n!==1?'s':''} pending review`;
+  container.innerHTML = jobs.map(renderCard).join('');
+}
+
+function renderCard(j) {
+  const src = j.source_stats || {};
+  const out = j.output_stats || {};
+  const srcName = j.source_path ? j.source_path.replace(/.*[\/\\]/,'') : j.job_id;
+  const outName = j.output_path ? j.output_path.replace(/.*[\/\\]/,'') : '—';
+  const szSav = pct(src.file_size_bytes, out.file_size_bytes);
+  const bpSav = pct(src.bitrate_kbps, out.bitrate_kbps);
+
+  return `<div class="card" id="c-${j.job_id}">
+  <div class="card-header">
+    <input type="checkbox" data-id="${j.job_id}" onchange="onCheck(this)">
+    <span class="card-filename" title="${esc(j.source_path||'')}">
+      ${esc(srcName)}
+    </span>
+    <span class="pill pill-pass">PASS ✓</span>
+    <span class="card-ts">${fmt_ts(j.submitted_at)}</span>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stats-col">
+      <div class="col-label">원본 Source · ${esc(srcName)}</div>
+      ${row('Codec',    src.codec||'—')}
+      ${row('Resolution', src.width ? `${src.width}×${src.height}` : '—')}
+      ${row('FPS',      src.fps ? src.fps.toFixed(3) : '—')}
+      ${row('Bitrate',  fmt_kbps(src.bitrate_kbps))}
+      ${row('Size',     fmt_bytes(src.file_size_bytes))}
+      ${row('Duration', fmt_dur(src.duration_secs))}
+      <div class="play-btn" onclick="openFile('${j.job_id}','source')">▶ Play source</div>
+    </div>
+    <div class="stats-col">
+      <div class="col-label">변환 Output · ${esc(outName)}</div>
+      ${row('Codec',    out.codec||'—', out.codec==='av1'?'hi':'')}
+      ${row('Resolution', out.width ? `${out.width}×${out.height}` : '—')}
+      ${row('FPS',      out.fps ? out.fps.toFixed(3) : '—')}
+      ${row('Bitrate',  fmt_kbps(out.bitrate_kbps) + (bpSav!=null?`<span class="savings">(↓${bpSav}%)</span>`:''))}
+      ${row('Size',     fmt_bytes(out.file_size_bytes) + (szSav!=null?`<span class="savings">(↓${szSav}%)</span>`:''))}
+      ${row('Duration', fmt_dur(out.duration_secs))}
+      <div class="play-btn" onclick="openFile('${j.job_id}','output')">▶ Play output</div>
+    </div>
+  </div>
+
+  <div class="encode-meta">
+    <span>⏱ Encode: <span class="v">${fmt_enc(j.encode_duration_secs)}</span></span>
+    <span>📤 Submitted: <span class="v">${fmt_ts(j.submitted_at)}</span></span>
+    ${j.encode_finished_at ? `<span>✓ Completed: <span class="v">${fmt_ts(j.encode_finished_at)}</span></span>` : ''}
+    <span style="margin-left:auto;opacity:.5;font-size:10px">${j.job_id}</span>
+  </div>
+
+  <div class="card-actions">
+    <button class="btn btn-reject" onclick="promptReject(['${j.job_id}'])">✗ Reject</button>
+    <span class="spacer"></span>
+    <select class="sel" id="act-${j.job_id}">
+      <option value="keep">Keep original</option>
+      <option value="rename">Rename original (.bak)</option>
+      <option value="replace">Replace original ⚠</option>
+    </select>
+    <button class="btn btn-accept" onclick="doAccept('${j.job_id}')">✓ Accept</button>
+  </div>
+</div>`;
+}
+
+function row(k, v, cls='') {
+  return `<div class="stat"><span class="sk">${k}</span><span class="sv ${cls}">${v}</span></div>`;
+}
+
+// ══ Job actions ══════════════════════════════════════════════════════════════════
+async function doAccept(id) {
+  const sel = $(`act-${id}`);
+  const action = sel ? sel.value : 'keep';
+  const r = await api(`/api/jobs/${id}/accept`, 'POST', {action}).catch(()=>null);
+  if (r && r.ok) {
+    jobs = jobs.filter(j => j.job_id !== id);
+    $('badge-count').textContent = jobs.length;
+    renderJobs();
+    toast('✓ Accepted');
+  } else {
+    toast('✗ Accept failed', 'fail');
+  }
+}
+
+function promptReject(ids) {
+  pendingRejectIds = ids;
+  $('modal').classList.remove('hidden');
+}
+
+function closeModal() {
+  $('modal').classList.add('hidden');
+  pendingRejectIds = null;
+}
+
+async function doReject(del) {
+  closeModal();
+  if (!pendingRejectIds?.length) return;
+  const ids = pendingRejectIds;
+  pendingRejectIds = null;
+
+  let ok;
+  if (ids.length === 1) {
+    const r = await api(`/api/jobs/${ids[0]}/reject`, 'POST', {delete_output: del}).catch(()=>null);
+    ok = r && r.ok;
+  } else {
+    const r = await api('/api/bulk/reject', 'POST', {ids, delete_output: del}).catch(()=>null);
+    ok = r && r.ok;
+  }
+
+  if (ok) {
+    jobs = jobs.filter(j => !ids.includes(j.job_id));
+    $('badge-count').textContent = jobs.length;
+    renderJobs();
+    toast(`✗ Rejected ${ids.length} job${ids.length!==1?'s':''}`, 'fail');
+  } else {
+    toast('✗ Reject failed', 'fail');
+  }
+}
+
+async function doBulkAccept() {
+  const ids = selectedIds();
+  if (!ids.length) return toast('No jobs selected');
+  const action = $('bulk-action').value;
+  const r = await api('/api/bulk/accept', 'POST', {ids, action}).catch(()=>null);
+  if (r && r.ok) {
+    jobs = jobs.filter(j => !ids.includes(j.job_id));
+    $('badge-count').textContent = jobs.length;
+    renderJobs();
+    toast(`✓ Accepted ${ids.length} job${ids.length!==1?'s':''}`);
+  } else {
+    toast('✗ Bulk accept failed', 'fail');
+  }
+}
+
+function doBulkReject() {
+  const ids = selectedIds();
+  if (!ids.length) return toast('No jobs selected');
+  promptReject(ids);
+}
+
+function selAll()  { document.querySelectorAll('input[data-id]').forEach(e => { e.checked = true;  onCheck(e); }); }
+function selNone() { document.querySelectorAll('input[data-id]').forEach(e => { e.checked = false; onCheck(e); }); }
+function selectedIds() { return [...document.querySelectorAll('input[data-id]:checked')].map(e=>e.dataset.id); }
+function onCheck(el) { el.closest('.card').classList.toggle('selected', el.checked); }
+
+async function openFile(id, which) {
+  await api(`/api/jobs/${id}/open/${which}`).catch(()=>null);
+}
+
+// ══ Settings ════════════════════════════════════════════════════════════════════
+async function loadSettings() {
+  const r = await api('/api/config').catch(()=>null);
+  if (!r || !r.ok) return;
+  const c = await r.json();
+  $('s-url').value          = c.server_url || '';
+  $('s-token').value        = c.auth_token || '';
+  $('s-review-mode').value  = c.behavior?.review_mode || 'auto';
+  $('s-on-success').value   = c.behavior?.on_success || 'rename';
+  $('s-suffix').value       = c.behavior?.backup_suffix || '.bak';
+  $('s-mode').value         = c.behavior?.mode || 'interactive';
+  $('s-skip-av1').checked   = c.behavior?.skip_if_av1 !== false;
+  $('s-min-dur').value      = c.behavior?.min_duration_secs ?? 30;
+  $('s-dirs').value         = (c.scan?.directories || []).join('\n');
+  $('s-exts').value         = (c.scan?.extensions  || []).join(',');
+  $('server-tag').textContent = c.server_url || '';
+}
+
+async function saveSettings() {
+  const cfg = {
+    server_url: $('s-url').value.trim(),
+    auth_token: $('s-token').value.trim() || null,
+    behavior: {
+      review_mode:      $('s-review-mode').value,
+      on_success:       $('s-on-success').value,
+      backup_suffix:    $('s-suffix').value || '.bak',
+      mode:             $('s-mode').value,
+      skip_if_av1:      $('s-skip-av1').checked,
+      min_duration_secs: parseInt($('s-min-dur').value) || 30,
+    },
+    scan: {
+      directories: $('s-dirs').value.split('\n').map(s=>s.trim()).filter(Boolean),
+      extensions:  $('s-exts').value.split(',').map(s=>s.trim().toLowerCase()).filter(Boolean),
+    }
+  };
+  const r = await api('/api/config', 'POST', cfg).catch(()=>null);
+  if (r && r.ok) {
+    toast('✓ 설정 저장됨 — Settings saved & applied');
+    $('server-tag').textContent = cfg.server_url;
+  } else {
+    toast('✗ Save failed', 'fail');
+  }
+}
+
+// ══ Init ════════════════════════════════════════════════════════════════════════
+loadJobs();
+loadSettings().then(() => {});
+setInterval(loadJobs, 8000);
+</script>
+</body>
+</html>

@@ -19,17 +19,11 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 #[cfg(unix)]
-use crate::api;
-#[cfg(unix)]
 use crate::config::Config;
 #[cfg(unix)]
+use crate::core::commands;
+#[cfg(unix)]
 use crate::core::ServerState;
-#[cfg(unix)]
-use crate::scan;
-#[cfg(unix)]
-use crate::reconcile;
-#[cfg(unix)]
-use crate::platform;
 
 #[cfg(unix)]
 pub const SOCK_PATH: &str = "/tmp/enkodu.sock";
@@ -41,7 +35,10 @@ pub fn start_server(cfg: Config, state: Arc<RwLock<ServerState>>) {
     let _ = std::fs::remove_file(SOCK_PATH);
     let listener = match UnixListener::bind(SOCK_PATH) {
         Ok(l) => l,
-        Err(e) => { warn!("IPC: cannot bind {}: {}", SOCK_PATH, e); return; }
+        Err(e) => {
+            warn!("IPC: cannot bind {}: {}", SOCK_PATH, e);
+            return;
+        }
     };
     info!("IPC: listening on {}", SOCK_PATH);
 
@@ -62,97 +59,14 @@ pub fn start_server(cfg: Config, state: Arc<RwLock<ServerState>>) {
 #[cfg(unix)]
 fn handle_conn(mut stream: UnixStream, cfg: Config, state: Arc<RwLock<ServerState>>) {
     let mut line = String::new();
-    if BufReader::new(&stream).read_line(&mut line).is_err() { return; }
+    if BufReader::new(&stream).read_line(&mut line).is_err() {
+        return;
+    }
     let cmd = line.trim().to_string();
     info!("IPC: received command '{}'", cmd);
 
-    let resp = dispatch(&cmd, &cfg, &state);
+    let resp = commands::dispatch(&cmd, &cfg, &state);
     let _ = stream.write_all(format!("{}\n", resp).as_bytes());
-}
-
-#[cfg(unix)]
-fn dispatch(
-    cmd: &str,
-    cfg: &Config,
-    state: &Arc<RwLock<ServerState>>,
-) -> String {
-    match cmd {
-        "scan" => {
-            let cfg2 = cfg.clone();
-            let mac_drain = state.read().unwrap().mac_drain;
-            thread::spawn(move || {
-                let platform = crate::platform::get_platform();
-                if mac_drain {
-                    platform.notify("Enkodu", "Mac submissions paused — scan skipped");
-                    return;
-                }
-                platform.notify("Enkodu", "Scanning for eligible videos...");
-                let files = scan::scan(&cfg2);
-                let all_paths: Vec<String> = files.iter()
-                    .map(|f| f.path.to_string_lossy().to_string())
-                    .collect();
-                let st = crate::state::load().unwrap_or_default();
-                let eligible: Vec<_> = files.into_iter().filter(|f| {
-                    let key = f.path.to_string_lossy().to_string();
-                    !matches!(st.get(&key).map(|e| e.status.as_str()), Some("pending" | "active" | "done"))
-                }).collect();
-                if !eligible.is_empty() {
-                    platform.notify("Enkodu", &format!("Batch: submitting {} files", eligible.len()));
-                    for f in eligible {
-                        let cfg3 = cfg2.clone();
-                        thread::spawn(move || {
-                            crate::core::submit::submit_bg(cfg3, f.path);
-                        });
-                    }
-                } else {
-                    platform.notify("Enkodu", "No new eligible videos found");
-                }
-            });
-            "ok: batch scan triggered".to_string()
-        }
-        "reconcile" => {
-            let cfg2 = cfg.clone();
-            thread::spawn(move || {
-                let platform = crate::platform::get_platform();
-                platform.notify("Enkodu", "Reconcile: scanning local files...");
-                let files = scan::scan(&cfg2);
-                reconcile::reconcile(&cfg2, &files);
-            });
-            "ok: reconcile triggered".to_string()
-        }
-        "status" => {
-            let s = state.read().unwrap();
-            format!(
-                "online={} pending={} active={} done={} failed={} mac_drain={} nas_drain={}",
-                s.online, s.pending, s.active, s.done, s.failed, s.mac_drain, s.nas_drain
-            )
-        }
-        "pause-nas" => {
-            state.write().unwrap().nas_drain = true;
-            let url = cfg.server_url.clone();
-            thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", "true"); });
-            crate::platform::get_platform().notify("Enkodu", "NAS scan paused");
-            "ok: NAS scan paused".to_string()
-        }
-        "resume-nas" => {
-            state.write().unwrap().nas_drain = false;
-            let url = cfg.server_url.clone();
-            thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", "false"); });
-            crate::platform::get_platform().notify("Enkodu", "NAS scan resumed");
-            "ok: NAS scan resumed".to_string()
-        }
-        "pause-mac" => {
-            state.write().unwrap().mac_drain = true;
-            crate::platform::get_platform().notify("Enkodu", "Mac submissions paused");
-            "ok: Mac submissions paused".to_string()
-        }
-        "resume-mac" => {
-            state.write().unwrap().mac_drain = false;
-            crate::platform::get_platform().notify("Enkodu", "Mac submissions resumed");
-            "ok: Mac submissions resumed".to_string()
-        }
-        other => format!("err: unknown command '{}' — try: scan, reconcile, status, pause-nas, resume-nas, pause-mac, resume-mac", other),
-    }
 }
 
 // ── client (runs when user types `enkodu <cmd>`) ──────────────────────────────

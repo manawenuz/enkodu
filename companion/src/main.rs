@@ -4,13 +4,17 @@
 //! adapters and the shared core logic.
 
 mod api;
+mod capabilities;
 mod config;
 mod ipc;
 mod reconcile;
+mod retry;
+mod review_server;
 mod scan;
 mod state;
 mod verify;
 mod wanryo;
+mod ws_client;
 
 // Core modules
 mod core;
@@ -19,10 +23,9 @@ mod platform;
 
 use anyhow::Result;
 use config::Config;
-use core::{ServerState, commands, batch, poll, submit, truncate};
+use core::{batch, commands, poll, submit, truncate, ServerState};
 use log::info;
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -47,6 +50,7 @@ struct Tray {
     mac_drain_item: CheckMenuItem,
     nas_drain_item: CheckMenuItem,
     reconcile_item: MenuItem,
+    review_item: MenuItem,
     login_item: CheckMenuItem,
     config_item: MenuItem,
     quit_item: MenuItem,
@@ -60,13 +64,23 @@ fn main() -> Result<()> {
     if args.len() > 1 {
         let platform = platform::get_platform();
         match args[1].as_str() {
+            "--version" | "-V" => {
+                println!("enkodu {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "tcpping" => {
-                let addr = args.get(2).map(|s| s.as_str()).unwrap_or("172.16.81.137:443");
+                let addr = args
+                    .get(2)
+                    .map(|s| s.as_str())
+                    .unwrap_or("172.16.81.137:443");
                 commands::cmd_tcpping(addr);
                 return Ok(());
             }
             "httping" => {
-                let url = args.get(2).map(|s| s.as_str()).unwrap_or("https://enkodu.manwe.qzz.io/status");
+                let url = args
+                    .get(2)
+                    .map(|s| s.as_str())
+                    .unwrap_or("https://enkodu.manwe.qzz.io/status");
                 commands::cmd_httping(url);
                 return Ok(());
             }
@@ -75,11 +89,23 @@ fn main() -> Result<()> {
                 commands::cmd_wanryo(&cfg)?;
                 return Ok(());
             }
+            "test" => {
+                let cfg = Config::load()?;
+                let result = api::test_connection(&cfg.server_url, cfg.auth_token.as_deref());
+                api::print_connection_test(&result);
+                return Ok(());
+            }
             _ => {
                 let cmd = args[1..].join(" ");
                 match platform.send_ipc_command(&cmd) {
-                    Ok(resp) => { println!("{}", resp); return Ok(()); }
-                    Err(e)   => { eprintln!("enkodu: {}", e); std::process::exit(1); }
+                    Ok(resp) => {
+                        println!("{}", resp);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("enkodu: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -94,12 +120,45 @@ fn main() -> Result<()> {
     let _lock = platform.acquire_single_instance_lock()?;
 
     let cfg = Config::load()?;
-    info!("Enkodu starting — server: {} (build {})", cfg.server_url, env!("GIT_HASH"));
+    info!(
+        "Enkodu starting — server: {} (build {})",
+        cfg.server_url,
+        env!("GIT_HASH")
+    );
+
+    if !verify::check_ffprobe_available() {
+        log::warn!("ffprobe not found — video probing will fail. Install ffmpeg and ensure ffprobe is on PATH.");
+        platform.notify(
+            "Enkodu: missing dependency",
+            "ffprobe not found. Install ffmpeg to enable video probing.",
+        );
+    }
 
     let state: Arc<RwLock<ServerState>> = Arc::new(RwLock::new(ServerState::default()));
 
+    // Live, mutable config shared with the review/settings server.
+    let live_cfg: Arc<RwLock<Config>> = Arc::new(RwLock::new(cfg.clone()));
+
+    // Start the local review + settings HTTP server (loopback only).
+    let review = review_server::ReviewServer::start(Arc::clone(&live_cfg));
+    let review_url = format!("http://127.0.0.1:{}/review", review.port);
+    info!("Review UI available at {}", review_url);
+
     // Start IPC server
     platform.start_ipc_server(cfg.clone(), Arc::clone(&state));
+
+    // Detect capabilities and register with server
+    let caps = capabilities::detect(
+        &verify::find_ffmpeg(),
+        &verify::find_ffprobe(),
+    );
+    // Register + report capabilities via HTTP (quick, on startup)
+    {
+        let cfg_snap = live_cfg.read().unwrap().clone();
+        let _ = register_with_server(&cfg_snap, &caps);
+    }
+    // Start WebSocket client
+    ws_client::start(Arc::clone(&live_cfg), caps);
 
     let mut builder = EventLoopBuilder::new();
     #[cfg(target_os = "macos")]
@@ -139,24 +198,36 @@ fn main() -> Result<()> {
             if last_update.elapsed() >= Duration::from_secs(2) {
                 let s = state_ref.read().unwrap().clone();
                 update_tray_menu(&tray, &s);
+                update_review_item(&tray);
                 last_update = Instant::now();
             }
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
-            handle_event(&ev, &tray, &cfg, &state_ref);
+            handle_event(&ev, &tray, &live_cfg, &state_ref, &review_url);
         }
     })?;
 
     Ok(())
 }
 
+/// Count of jobs awaiting manual review and refresh the tray menu item.
+fn update_review_item(tray: &Tray) {
+    let count = state::load()
+        .map(|s| s.values().filter(|e| e.status == "pending_review").count())
+        .unwrap_or(0);
+    if count > 0 {
+        tray.review_item.set_text(format!("Review Jobs ({} pending)…", count));
+        tray.review_item.set_enabled(true);
+    } else {
+        tray.review_item.set_text("Review Jobs (0 pending)");
+        tray.review_item.set_enabled(false);
+    }
+}
+
 // ── tray construction ─────────────────────────────────────────────────────────
 
-fn build_tray(
-    cfg: &Config,
-    state: &Arc<RwLock<ServerState>>,
-) -> Result<Tray> {
+fn build_tray(cfg: &Config, _state: &Arc<RwLock<ServerState>>) -> Result<Tray> {
     let platform = platform::get_platform();
     let status_item = MenuItem::new("○ Connecting...", false, None);
     let job_item = MenuItem::new("No active jobs", false, None);
@@ -165,9 +236,10 @@ fn build_tray(
     let webui_item = MenuItem::new("Open Web UI", true, None);
     let drain_item = MenuItem::new("⏸  Drain Worker", true, None);
     let resume_item = MenuItem::new("▶  Resume Worker", false, None);
-    let mac_drain_item = CheckMenuItem::new("⏸  Pause Mac Submissions", true, false, None);
+    let mac_drain_item = CheckMenuItem::new("⏸  Pause Local Submissions", true, false, None);
     let nas_drain_item = CheckMenuItem::new("⏸  Pause NAS Scan", true, false, None);
     let reconcile_item = MenuItem::new("Reconcile Server Jobs", true, None);
+    let review_item = MenuItem::new("Review Jobs (0 pending)", false, None);
     let login_item = CheckMenuItem::new("Start at Login", true, platform.autostart_enabled(), None);
     let config_item = MenuItem::new("Open Config...", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -188,6 +260,7 @@ fn build_tray(
     menu.append(&nas_drain_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&reconcile_item).unwrap();
+    menu.append(&review_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&login_item).unwrap();
     menu.append(&config_item).unwrap();
@@ -213,6 +286,7 @@ fn build_tray(
         mac_drain_item,
         nas_drain_item,
         reconcile_item,
+        review_item,
         login_item,
         config_item,
         quit_item,
@@ -266,13 +340,19 @@ fn update_tray_menu(tray: &Tray, s: &ServerState) {
 fn handle_event(
     ev: &muda::MenuEvent,
     tray: &Tray,
-    cfg: &Config,
+    live_cfg: &Arc<RwLock<Config>>,
     state: &Arc<RwLock<ServerState>>,
+    review_url: &str,
 ) {
-    if ev.id == tray.quit_item.id() {
+    // Snapshot the current config so handlers see the latest saved settings.
+    let cfg = live_cfg.read().unwrap().clone();
+    let cfg = &cfg;
+    if ev.id == tray.review_item.id() {
+        info!("Opening review UI: {}", review_url);
+        let _ = platform::get_platform().open_url(review_url);
+    } else if ev.id == tray.quit_item.id() {
         info!("Quit requested");
         std::process::exit(0);
-
     } else if ev.id == tray.submit_item.id() {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Select video to transcode")
@@ -286,7 +366,6 @@ fn handle_event(
                 submit::submit_bg(cfg, path_clone);
             });
         }
-
     } else if ev.id == tray.batch_item.id() {
         info!("Batch scan triggered");
         let cfg = cfg.clone();
@@ -294,38 +373,58 @@ fn handle_event(
         thread::spawn(move || {
             batch::batch_bg(cfg, mac_drain);
         });
-
     } else if ev.id == tray.webui_item.id() {
         info!("Opening web UI: {}", cfg.server_url);
         let _ = platform::get_platform().open_url(&cfg.server_url);
-
     } else if ev.id == tray.drain_item.id() {
         info!("Draining worker");
         let url = cfg.server_url.clone();
-        thread::spawn(move || { let _ = api::set_control(&url, "drain"); });
-
+        let token = cfg.auth_token.clone();
+        thread::spawn(move || {
+            let _ = api::set_control(&url, token.as_deref(), "drain");
+        });
     } else if ev.id == tray.resume_item.id() {
         info!("Resuming worker");
         let url = cfg.server_url.clone();
-        thread::spawn(move || { let _ = api::set_control(&url, "run"); });
-
+        let token = cfg.auth_token.clone();
+        thread::spawn(move || {
+            let _ = api::set_control(&url, token.as_deref(), "run");
+        });
     } else if ev.id == tray.mac_drain_item.id() {
         let new_state = !state.read().unwrap().mac_drain;
         state.write().unwrap().mac_drain = new_state;
         tray.mac_drain_item.set_checked(new_state);
-        info!("Mac submissions {}", if new_state { "paused" } else { "resumed" });
-        platform::get_platform().notify("Enkodu", if new_state { "Mac submissions paused" } else { "Mac submissions resumed" });
-
+        info!(
+            "Local submissions {}",
+            if new_state { "paused" } else { "resumed" }
+        );
+        platform::get_platform().notify(
+            "Enkodu",
+            if new_state {
+                "Local submissions paused"
+            } else {
+                "Local submissions resumed"
+            },
+        );
     } else if ev.id == tray.nas_drain_item.id() {
         let new_state = !state.read().unwrap().nas_drain;
         state.write().unwrap().nas_drain = new_state;
         tray.nas_drain_item.set_checked(new_state);
         let url = cfg.server_url.clone();
+        let token = cfg.auth_token.clone();
         let val = if new_state { "true" } else { "false" };
-        thread::spawn(move || { let _ = api::set_setting(&url, "nas_drain", val); });
+        thread::spawn(move || {
+            let _ = api::set_setting(&url, token.as_deref(), "nas_drain", val);
+        });
         info!("NAS scan {}", if new_state { "paused" } else { "resumed" });
-        platform::get_platform().notify("Enkodu", if new_state { "NAS scan paused" } else { "NAS scan resumed" });
-
+        platform::get_platform().notify(
+            "Enkodu",
+            if new_state {
+                "NAS scan paused"
+            } else {
+                "NAS scan resumed"
+            },
+        );
     } else if ev.id == tray.reconcile_item.id() {
         info!("Reconcile triggered manually");
         let cfg = cfg.clone();
@@ -334,14 +433,62 @@ fn handle_event(
             let files = scan::scan(&cfg);
             reconcile::reconcile(&cfg, &files);
         });
-
     } else if ev.id == tray.config_item.id() {
         let _ = platform::get_platform().open_path(&Config::path());
-
     } else if ev.id == tray.login_item.id() {
         let platform = platform::get_platform();
         let enabled = !platform.autostart_enabled();
         let _ = platform.set_autostart(enabled);
         tray.login_item.set_checked(enabled);
     }
+}
+
+fn register_with_server(
+    cfg: &config::Config,
+    caps: &capabilities::Capabilities,
+) -> anyhow::Result<()> {
+    use reqwest::blocking::Client;
+    use std::time::Duration;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let base = cfg.server_url.trim_end_matches('/');
+    let id = &cfg.companion_id;
+
+    // Register
+    let reg_url = format!("{}/companions/{}/register", base, id);
+    let reg_body = serde_json::json!({
+        "name": std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "companion".to_string()),
+        "platform": caps.platform,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    let mut req = client.post(&reg_url).json(&reg_body);
+    if let Some(token) = &cfg.auth_token {
+        req = req.bearer_auth(token);
+    }
+    let _ = req.send(); // fire-and-forget; server may be offline
+
+    // Fetch pending config
+    let cfg_url = format!("{}/companions/{}/config", base, id);
+    let mut req = client.get(&cfg_url);
+    if let Some(token) = &cfg.auth_token {
+        req = req.bearer_auth(token);
+    }
+    let _ = req.send();
+
+    // Report capabilities
+    let caps_url = format!("{}/companions/{}/capabilities", base, id);
+    let caps_body = serde_json::json!({
+        "encoders": caps.encoders,
+        "decoders": caps.decoders,
+        "ffprobe_available": caps.ffprobe_available,
+        "platform": caps.platform,
+    });
+    let mut req = client.post(&caps_url).json(&caps_body);
+    if let Some(token) = &cfg.auth_token {
+        req = req.bearer_auth(token);
+    }
+    let _ = req.send();
+
+    Ok(())
 }

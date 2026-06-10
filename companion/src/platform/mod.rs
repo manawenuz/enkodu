@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use crate::core::ServerState;
 
-pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -66,6 +66,7 @@ pub trait Platform: Send + Sync {
 }
 
 /// Get the platform-specific implementation.
+#[allow(unreachable_code)]
 pub fn get_platform() -> &'static dyn Platform {
     #[cfg(target_os = "macos")]
     return &macos::MacPlatform;
