@@ -60,6 +60,16 @@ def _fix_mojibake(s: str) -> str:
     except (UnicodeEncodeError, UnicodeDecodeError):
         return s
 
+def _safe_basename(name: str) -> str:
+    """Reduce a client-supplied filename to a bare basename so it can never be
+    used for path traversal (e.g. '../../x' or '/etc/passwd' or 'C:\\x') when it
+    is later used to build a rename target. Falls back to a safe default."""
+    base = Path((name or "").replace("\\", "/")).name
+    if base in ("", ".", ".."):
+        ext = Path(name or "").suffix or ".mp4"
+        return f"upload{ext}"
+    return base
+
 _KPOP_ADJ = [
     "Starry","Neon","Crystal","Velvet","Lunar","Solar","Dreamy","Cosmic",
     "Prism","Silky","Aurora","Ivory","Golden","Silver","Misty","Blazing",
@@ -144,6 +154,7 @@ AUTH_LEGACY_MACHINE_ACCESS = _env_bool("AUTH_LEGACY_MACHINE_ACCESS", True)
 AUTH_API_TOKEN = os.getenv("AUTH_API_TOKEN", "")
 AUTH_WORKER_TOKEN = os.getenv("AUTH_WORKER_TOKEN", "")
 AUTH_COMPANION_TOKEN = os.getenv("AUTH_COMPANION_TOKEN", "")
+AUTH_BOOTSTRAP_TOKEN = os.getenv("AUTH_BOOTSTRAP_TOKEN", "")
 
 AUTHENTIK_ENABLED = _env_bool("AUTHENTIK_ENABLED", False)
 AUTHENTIK_DISCOVERY_URL = os.getenv("AUTHENTIK_DISCOVERY_URL", "").strip()
@@ -1024,8 +1035,10 @@ def _stall_watchdog():
                     if live and live.get("updated_at", 0) > cutoff:
                         continue
                     conn.execute(
-                        "UPDATE jobs SET status='pending', worker=NULL, error=NULL, percent=0, updated_at=? WHERE id=?",
-                        (time.time(), row["id"])
+                        "UPDATE jobs SET status='pending', worker=NULL, error=NULL, percent=0,"
+                        " verify_status=NULL, verify_detail=NULL, verify_checks=NULL, output_meta=NULL, output_size=NULL,"
+                        " updated_at=? WHERE id=? AND status='active' AND worker=?",
+                        (time.time(), row["id"], row["worker"])
                     )
                     fname = Path(row["source_path"]).name if row["source_path"] else row["id"]
                     log.warning("Stall watchdog: requeued %s (worker=%s)", fname, row["worker"])
@@ -1365,23 +1378,32 @@ def admin_invite(req: AdminInviteReq, request: Request):
 class BootstrapReq(BaseModel):
     username: str
     display_name: str | None = None
-    role: str = "admin"
+    secret: str | None = None
 
 @app.post("/auth/bootstrap")
 def auth_bootstrap(req: BootstrapReq):
-    """One-time first-user setup. Only works when auth_users table is empty."""
+    """One-time first-user setup. Gated by the AUTH_BOOTSTRAP_TOKEN out-of-band
+    secret; disabled entirely when that env var is unset. Always creates an admin."""
+    if not AUTH_BOOTSTRAP_TOKEN:
+        raise HTTPException(403, "bootstrap disabled: AUTH_BOOTSTRAP_TOKEN is not set")
+    if not req.secret or not hmac.compare_digest(req.secret, AUTH_BOOTSTRAP_TOKEN):
+        raise HTTPException(403, "bootstrap denied: invalid secret")
     now = _now()
     with db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM auth_users").fetchone()[0]
         if count > 0:
             raise HTTPException(403, "bootstrap disabled: users already exist")
         user_id = str(uuid.uuid4())
-        conn.execute("""
-            INSERT INTO auth_users
-                (id, username, display_name, email, role, source, enabled, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,1,?,?)
-        """, (user_id, req.username, req.display_name or req.username,
-              None, req.role, "local", now, now))
+        try:
+            conn.execute("""
+                INSERT INTO auth_users
+                    (id, username, display_name, email, role, source, enabled, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,1,?,?)
+            """, (user_id, req.username, req.display_name or req.username,
+                  None, "admin", "local", now, now))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            raise HTTPException(403, "bootstrap disabled: users already exist")
         token = _create_invite(conn, user_id, 3600)
     return {"ok": True, "setup_url": _setup_url(token), "expires_in_secs": 3600}
 
@@ -1958,7 +1980,9 @@ def next_job(worker: str = "unknown"):
 def abandon(worker: str = "unknown"):
     with db() as conn:
         conn.execute(
-            "UPDATE jobs SET status='pending', worker=NULL, updated_at=? WHERE status='active' AND worker=?",
+            "UPDATE jobs SET status='pending', worker=NULL,"
+            " verify_status=NULL, verify_detail=NULL, verify_checks=NULL, output_meta=NULL, output_size=NULL,"
+            " updated_at=? WHERE status='active' AND worker=?",
             (time.time(), worker)
         )
         conn.commit()
@@ -2009,7 +2033,13 @@ def _do_delete_original(job_id: str, rename: bool) -> dict:
     if rename and out and out.exists():
         orig_name = row["source_filename"] or (src.name if src else None)
         if orig_name:
-            new_path = out.parent / orig_name
+            # Defense-in-depth: strip any path components from the (client-supplied)
+            # source_filename and require the rename target to stay inside the
+            # output's own directory, so a poisoned filename cannot move/overwrite
+            # a file elsewhere on disk.
+            new_path = out.parent / Path(orig_name.replace("\\", "/")).name
+            if new_path.resolve().parent != out.parent.resolve():
+                raise HTTPException(400, "unsafe rename target")
             out.rename(new_path)
             with db() as conn:
                 conn.execute("UPDATE jobs SET output_path=? WHERE id=?", (str(new_path), job_id))
@@ -2196,11 +2226,17 @@ def done(job_id: str, body: DoneBody):
             "SELECT source_path, source_duration_secs, output_path, source_meta FROM jobs WHERE id=?",
             (job_id,)
         ).fetchone()
-        conn.execute(
-            "UPDATE jobs SET status='done', output_size=?, percent=100, updated_at=? WHERE id=?",
-            (body.output_size, time.time(), job_id)
-        )
+        updated = conn.execute(
+            "UPDATE jobs SET status='done', output_size=?, percent=100,"
+            " verify_status='running', verify_detail=NULL, verify_checks=NULL, output_meta=NULL,"
+            " updated_at=? WHERE id=? AND status='active' AND worker=?",
+            (body.output_size, time.time(), job_id, body.worker)
+        ).rowcount
         conn.commit()
+    if not updated:
+        # Job was reassigned (e.g. stall watchdog) and is no longer owned by this
+        # worker; refuse to complete so a stale worker cannot clobber the result.
+        raise HTTPException(409, "job not owned by this worker")
     _live.pop(job_id, None)
     _worker_update(body.worker, "idle")
     fname    = Path(row["source_path"]).name if row and row["source_path"] else job_id
@@ -2219,11 +2255,13 @@ class FailedBody(BaseModel):
 @app.post("/jobs/{job_id}/failed")
 def failed(job_id: str, body: FailedBody):
     with db() as conn:
-        conn.execute(
-            "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
-            (body.error, time.time(), job_id)
-        )
+        updated = conn.execute(
+            "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=? AND status='active' AND worker=?",
+            (body.error, time.time(), job_id, body.worker)
+        ).rowcount
         conn.commit()
+    if not updated:
+        raise HTTPException(409, "job not owned by this worker")
     _live.pop(job_id, None)
     _worker_update(body.worker, "idle")
     with db() as _c:
@@ -2435,10 +2473,19 @@ async def upload_output(job_id: str, request: Request):
     out_path = Path(row["output_path"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     size = 0
+    last_heartbeat = time.time()
     with open(out_path, "wb") as f:
         async for chunk in request.stream():
             f.write(chunk)
             size += len(chunk)
+            # Keep the job's updated_at fresh during a slow upload so the stall
+            # watchdog does not requeue a job whose output is still being copied.
+            now = time.time()
+            if now - last_heartbeat >= 30:
+                last_heartbeat = now
+                with db() as conn:
+                    conn.execute("UPDATE jobs SET updated_at=? WHERE id=?", (now, job_id))
+                    conn.commit()
     return {"ok": True, "bytes": size}
 
 @app.get("/jobs/{job_id}")
@@ -2649,7 +2696,7 @@ UPLOADS_ROOT = Path("/data/.transcode/uploads")
 @app.post("/jobs/upload")
 async def upload_job(request: Request, x_filename: str = Header(...),
                      x_filepath: str = Header(None)):
-    orig_filename = _fix_mojibake(unquote(x_filename))
+    orig_filename = _safe_basename(_fix_mojibake(unquote(x_filename)))
     client_path   = _fix_mojibake(unquote(x_filepath)) if x_filepath else None
     job_id   = str(uuid.uuid4())
     ext      = Path(orig_filename).suffix or ".mp4"
@@ -2788,7 +2835,7 @@ async def resumable_start(req: ResumableStartReq):
     upload_id = str(uuid.uuid4())
     session = UploadSession(
         upload_id=upload_id,
-        filename=_fix_mojibake(req.filename),
+        filename=_safe_basename(_fix_mojibake(req.filename)),
         filepath=_fix_mojibake(req.filepath) if req.filepath else None,
         total_size=req.total_size,
         chunk_size=CHUNK_SIZE,
@@ -3096,7 +3143,9 @@ def download_companion():
 def requeue(job_id: str):
     with db() as conn:
         conn.execute(
-            "UPDATE jobs SET status='pending', worker=NULL, error=NULL, percent=0, updated_at=? WHERE id=?",
+            "UPDATE jobs SET status='pending', worker=NULL, error=NULL, percent=0,"
+            " verify_status=NULL, verify_detail=NULL, verify_checks=NULL, output_meta=NULL, output_size=NULL,"
+            " updated_at=? WHERE id=?",
             (time.time(), job_id)
         )
         conn.commit()
@@ -3960,7 +4009,7 @@ async function loadWorkers() {{
       const sc = w.online ? (WORKER_COLORS[w.status]||'#555') : '#c62828';
       const sl = w.online ? (w.status||'idle').toUpperCase() : 'DEAD';
       const ageStr = w.online ? `<span style="color:#444;font-size:9px">${{age}}s ago</span>` : `<span style="color:#c62828;font-size:9px">last seen ${{age}}s ago</span>`;
-      const fl = w.current_file ? `<span style="color:#555;font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{w.current_file}}">${{esc(w.current_file)}}</span>` : '';
+      const fl = w.current_file ? `<span style="color:#555;font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{esc(w.current_file)}}">${{esc(w.current_file)}}</span>` : '';
       return `<div style="background:#13132a;border:1px solid ${{w.online?'#1e1e3a':'#c6282844'}};border-radius:10px;padding:8px 14px;display:inline-flex;align-items:center;gap:8px">
         ${{dot}}<span style="color:#e0e0e0;font-size:12px">${{esc(w.name)}}</span>
         <span style="background:${{sc}}22;color:${{sc}};border:1px solid ${{sc}}44;padding:1px 8px;border-radius:20px;font-size:9px">${{sl}}</span>
@@ -4577,7 +4626,7 @@ function tryParse(s) {{
 }}
 
 function esc(s) {{
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }}
 
 function fmtDur(s) {{
@@ -4678,13 +4727,20 @@ function renderNodeCard(c) {{
       first seen: ${{firstSeen}} · last seen: ${{lastSeen}}
     </div>
     <div class="node-actions">
-      <button class="btn-promote" onclick="promoteCompanion('${{c.id}}', ${{!c.is_worker}})">${{promoteLabel}}</button>
+      <button class="btn-promote" data-cid="${{esc(c.id)}}" data-worker="${{!c.is_worker ? 1 : 0}}">${{promoteLabel}}</button>
     </div>
   </div>`;
 }}
 
+// Delegated handler: never build inline JS from untrusted companion ids.
+document.getElementById('nodes-list').addEventListener('click', (e) => {{
+  const btn = e.target.closest('.btn-promote');
+  if (!btn) return;
+  promoteCompanion(btn.dataset.cid, btn.dataset.worker === '1');
+}});
+
 async function promoteCompanion(cid, asWorker) {{
-  await fetch('/companions/'+cid+'/promote?is_worker='+asWorker, {{method:'POST'}});
+  await fetch('/companions/'+encodeURIComponent(cid)+'/promote?is_worker='+asWorker, {{method:'POST'}});
   loadCompanions();
 }}
 
@@ -4786,6 +4842,15 @@ init();
 
 # ── companion registry ────────────────────────────────────────────────────────
 
+_CID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+def _require_valid_cid(cid: str):
+    """Reject companion ids containing anything but [A-Za-z0-9_-] so they can
+    never carry HTML/JS metacharacters into the DB (defense-in-depth for the
+    dashboard which renders ids)."""
+    if not _CID_RE.match(cid or ""):
+        raise HTTPException(400, "invalid companion id")
+
 class CompanionRegisterReq(BaseModel):
     name: str = ""
     platform: str = ""
@@ -4793,6 +4858,7 @@ class CompanionRegisterReq(BaseModel):
 
 @app.post("/companions/{cid}/register")
 def companion_register(cid: str, req: CompanionRegisterReq):
+    _require_valid_cid(cid)
     now = time.time()
     with db() as conn:
         existing = conn.execute("SELECT id FROM companion_registry WHERE id=?", (cid,)).fetchone()
@@ -4827,6 +4893,7 @@ class CompanionSetConfigReq(BaseModel):
 
 @app.put("/companions/{cid}/config")
 def companion_set_config(cid: str, req: CompanionSetConfigReq):
+    _require_valid_cid(cid)
     now = time.time()
     cfg_json = json.dumps(req.config)
     with db() as conn:
@@ -4866,6 +4933,7 @@ class CompanionCapabilitiesReq(BaseModel):
 
 @app.post("/companions/{cid}/capabilities")
 def companion_set_capabilities(cid: str, req: CompanionCapabilitiesReq):
+    _require_valid_cid(cid)
     now = time.time()
     caps_json = json.dumps(req.dict())
     with db() as conn:
@@ -5087,6 +5155,11 @@ def _ws_push(cid: str, message: dict):
 @app.websocket("/ws/{kind}/{cid}")
 async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
     global _ws_async_lock
+    # Reject ids carrying HTML/JS metacharacters before they reach the registry
+    # (the dashboard renders companion/worker ids).
+    if not _CID_RE.match(cid or ""):
+        await ws.close(code=4401)
+        return
     # Auth check
     if AUTH_ENABLED:
         expected = AUTH_COMPANION_TOKEN if kind == "companion" else AUTH_WORKER_TOKEN
@@ -5227,30 +5300,39 @@ async def ws_endpoint(ws: WebSocket, kind: str, cid: str, token: str = ""):
                             "SELECT source_duration_secs, output_path, source_meta FROM jobs WHERE id=?",
                             (job_id,)
                         ).fetchone()
-                        conn.execute(
-                            "UPDATE jobs SET status='done', output_size=?, percent=100, updated_at=? WHERE id=?",
-                            (output_size, now, job_id)
-                        )
+                        updated = conn.execute(
+                            "UPDATE jobs SET status='done', output_size=?, percent=100,"
+                            " verify_status='running', verify_detail=NULL, verify_checks=NULL, output_meta=NULL,"
+                            " updated_at=? WHERE id=? AND status='active' AND worker=?",
+                            (output_size, now, job_id, cid)
+                        ).rowcount
                         conn.commit()
-                    if row:
-                        _run_verification(job_id, row["output_path"], row["source_duration_secs"], row["source_meta"] or "{}")
-                    _live.pop(job_id, None)
-                    _worker_update(cid, "idle")
-                    log.info("WS done: job=%s size=%d", job_id, output_size)
+                    if not updated:
+                        # Job reassigned away from this worker — ignore to avoid clobber.
+                        log.warning("WS done ignored: job=%s not owned by %s", job_id, cid)
+                    else:
+                        if row:
+                            _run_verification(job_id, row["output_path"], row["source_duration_secs"], row["source_meta"] or "{}")
+                        _live.pop(job_id, None)
+                        _worker_update(cid, "idle")
+                        log.info("WS done: job=%s size=%d", job_id, output_size)
 
             elif msg_type == "failed" and kind == "worker":
                 job_id = data.get("job_id", "")
                 error = data.get("error", "")
                 if job_id:
                     with db() as conn:
-                        conn.execute(
-                            "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=?",
-                            (error[:2000], now, job_id)
-                        )
+                        updated = conn.execute(
+                            "UPDATE jobs SET status='failed', error=?, updated_at=? WHERE id=? AND status='active' AND worker=?",
+                            (error[:2000], now, job_id, cid)
+                        ).rowcount
                         conn.commit()
-                    _live.pop(job_id, None)
-                    _worker_update(cid, "idle")
-                    log.warning("WS failed: job=%s error=%s", job_id, error[:200])
+                    if not updated:
+                        log.warning("WS failed ignored: job=%s not owned by %s", job_id, cid)
+                    else:
+                        _live.pop(job_id, None)
+                        _worker_update(cid, "idle")
+                        log.warning("WS failed: job=%s error=%s", job_id, error[:200])
 
     except WebSocketDisconnect:
         log.info("WS disconnect: %s (%s)", cid[:8], kind)

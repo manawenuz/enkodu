@@ -3709,6 +3709,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.8.6",
  "sha1",
  "thiserror 1.0.69",

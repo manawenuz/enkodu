@@ -176,3 +176,93 @@ The `detect_encoder` calls use isolated, clean clones of `cfg` for each codec te
 - **All 2 worker fixes applied successfully.** Cargo build clean.
 - **Build verification complete:** Both `companion` and `worker` compile with zero new errors.
 - **Post-fix verifier caught 2 protocol mismatches (R1, R2):** fixed inline — UI `renderNodeCard` now handles both object and array encoder formats; no DB normalization needed.
+
+---
+
+# Enkodu Security Audit — Round 2 — 2026-06-20
+
+## Scope & method
+
+Multi-agent audit (11 component×lens auditors → adversarial verification of every Critical/High
+finding → fix → independent fix-verification + build). This round specifically targeted the
+**auth/session/passkey/invite/bootstrap/admin layer** added *after* the 2026-06-10 audit (commits
+`2e1d884`, `3988689`, `890d81b`), which had never been reviewed and is **exposed publicly** at
+`https://enkodu.manwe.qzz.io` (Tailscale + Traefik).
+
+**Summary:** 52 findings. 16 Critical/High verified → **10 confirmed and FIXED**, 6 downgraded by
+adversarial verifiers (the dangerous preconditions are not present in the deployed
+`docker-compose.yml`/secrets). All three components build clean (`py_compile`, `cargo check` ×2).
+
+## Fixed (Critical/High)
+
+| ID | Sev | Component | Issue | Fix |
+|----|-----|-----------|-------|-----|
+| AUTH-1 | HIGH | queue | Public unauthenticated `/auth/bootstrap` mints first admin (remote admin seizure during empty-table window) | Gated on out-of-band `AUTH_BOOTSTRAP_TOKEN` (fail-closed 403 when unset), constant-time secret compare, role forced to `admin` server-side (`role` field removed), INSERT wrapped in `try/except IntegrityError` (TOCTOU closed via `username UNIQUE`) |
+| LIFECYCLE-1 | HIGH | queue | Stale `verify_status='pass'` survived requeue/re-complete → delete-original could destroy an original against an unverified output | `done` (HTTP+WS) sets `verify_status='running'` & clears verify fields in the same UPDATE as `status='done'`; `requeue`/`abandon`/stall-watchdog NULL all verify fields |
+| LIFECYCLE-2 | HIGH | queue | Stall watchdog requeued jobs mid copy/verify → two workers encode the same job and overwrite the same NAS output | Ownership-checked completion (`WHERE status='active' AND worker=?` → 409/ignore on mismatch); upload handler heartbeats `updated_at` every ~30s; worker now reports with `worker_name_url` to match claim identity |
+| FILE-1 | HIGH | queue | Path traversal / arbitrary overwrite via attacker-controlled `source_filename` in delete-original rename | `_safe_basename()` at both ingest points + resolved-parent containment check at the rename sink (defends already-poisoned rows) |
+| XSS-1 | HIGH | queue | Stored XSS via companion `id` in an inline `onclick` (Nodes tab) | `data-*` attributes + delegated listener (no JS-string context), `esc()` hardened for `'`, server-side `_CID_RE` validation on register/config/capabilities/WS routes |
+| XSS-2 | HIGH | queue | Stored XSS via worker `current_file` in a `title` attribute | Wrapped value in `esc()` |
+| WORKER-1 | HIGH | worker | Server-controlled `job.id` used as a filesystem path (traversal → arbitrary dir create/write/delete) | `is_safe_job_id()` (`^[A-Za-z0-9_-]{1,64}$`) at all 3 deserialization boundaries + work_dir-escape assertion before any create/remove |
+| COMP-1 (config) | HIGH | companion | Companion blindly persisted arbitrary server-pushed config (`server_url`/`auth_token`/`on_success`) | `apply_server_config` whitelist-merges only non-destructive fields; security fields pinned to local config — server can't redirect the token or flip to in-place `replace` |
+| WS-1 | HIGH | companion | Server-driven `assign_upload` read/exfiltrated arbitrary local files (and, with replace, overwrote them) | `path_in_scan_dirs()` canonicalizes the requested path and requires it inside a configured scan dir (fail-closed) |
+| COMP-1 (token leak) | HIGH | companion | Review server leaked the queue `auth_token` via unauthenticated `GET /api/config` with `CORS *` | Redact token to a `__SET__` sentinel (round-trips on save), removed wildcard CORS, added Host/Origin validation (anti DNS-rebind) |
+
+Files changed: `queue/main.py`, `worker/src/main.rs`, `companion/src/ws_client.rs`, `companion/src/review_server.rs`.
+
+## ⚠️ Operator action required
+
+- **`/auth/bootstrap` is now disabled unless `AUTH_BOOTSTRAP_TOKEN` is set in the queue
+  environment**, and callers must `POST {"username": ..., "secret": "<that token>"}`. The `role`
+  field is no longer accepted (always admin). Add `AUTH_BOOTSTRAP_TOKEN` to the queue env
+  (docker-compose/.env) **before** first-run bootstrap. The server-side CLI
+  `auth create-user`/`auth invite` flow is unaffected.
+
+## Downgraded by adversarial verifiers (not fixed — preconditions absent in prod)
+
+- **AUTH-2 / WS-1(infra)** → low: `AUTH_ENABLED` defaults to `False` in code, but `docker-compose.yml`
+  hardcodes `"true"` (not interpolated from `.env`), so the omission vectors don't apply.
+- **WS-2** → medium: WS auth fails open only if `AUTH_ENABLED=true` *and* a machine token is left empty
+  (self-contradictory misconfig; both tokens are set in prod).
+- **WS-3** → medium: `done/failed/progress` trust a self-asserted worker id, but the shared worker
+  token means per-worker scoping wouldn't help, and the delete-original safety gate still holds.
+- **COMP-2 / WANRYO-1** → medium: server-driven local file read / wanryo unvalidated download both
+  require an already-malicious/compromised server; originals are never touched.
+
+## Open backlog (Medium/Low — not in this round's Critical/High scope)
+
+- **AUTH_ENABLED fail-open default** (INFRA-2/LIFECYCLE-4): default to `True`, or refuse to start open on an https origin.
+- **WS auth/HTTP inconsistency** (INFRA-1/WS-2): mirror `AUTH_LEGACY_MACHINE_ACCESS`; reject unknown `kind`.
+- **WS role confusion** (WS-4): a worker-token socket can `hello`/`file_list` as a companion.
+- **Missing CIDR allowlist** (FILE-2): the `ALLOWED_CIDRS` network defense documented in secrets isn't implemented in code.
+- **Resumable-upload unbounded offset** (FILE-3/INFRA-5): sparse-file / disk-exhaustion DoS.
+- **Job-state forging** (WS-3/LIFECYCLE-3): `progress`/state transitions still lack ownership/state checks.
+- **Dashboard XSS depth** (XSS-3/XSS-4/HDR-1): unescaped media metadata in detail panel; no CSP / `X-Frame-Options`.
+- **Spoofable client IP** (AUTH-3): `X-Real-IP`/`X-Forwarded-For` trusted without a trusted-proxy allowlist.
+- **Jellyfin auto-link priv-esc** (INFRA-3): username-match auto-link into admin (only if Jellyfin SSO enabled).
+- **Container hardening** (INFRA-4): queue runs as root, no HEALTHCHECK, mutable `:main` tag with `pull_policy: always`.
+- **Companion local exposure** (COMP-2/COMP-3/REVIEW-1/COMP-5): world-readable secret files, unauthenticated Unix IPC socket, review-server CSRF on destructive endpoints.
+- **Download corruption on 200-not-206** (DL-1); **TLS WS has no read timeout** (WORKER-4/COMP-4); **token in WS query string** (WORKER-3/COMP-3/INFRA-6).
+- **Mobile** (MOB-1..5): Android plaintext-token fallback + `allowBackup=true`; iOS background transfer omits auth header; cleartext-URL validators; force-unwrap crash; stale singleton base URL.
+
+## Regression tests for this round
+
+Each fix has a regression test designed to fail against the pre-fix code. Status: **all green**.
+
+| Suite | How to run | Tests |
+|-------|-----------|-------|
+| queue | `cd queue && python -m pytest test_security.py test_safety.py` | 37 (31 new in `test_security.py`) |
+| worker | `cd worker && cargo test` | 28 (9 new) |
+| companion | `cd companion && cargo test` | 66 (21 new) |
+| android | `cd mobile/android && gradle :app:testDebugUnitTest` (needs SDK; no gradlew wrapper) | 10 (pre-existing) |
+
+- **⚠️ Python 3.11 (or the container's 3.12), NOT 3.14.** `pydantic-core==2.9.2` has no prebuilt
+  wheel for 3.14 and fails to compile, so `pip install -r queue/requirements.txt` breaks on 3.14.
+  Build the test venv with `python3.11 -m venv` (deps + `pytest` + `requests` install cleanly there).
+- `queue/test_e2e.py` and `queue/test_resumable.py` are **manual operator smoke scripts** (take a live
+  base-URL + a real video via argv, use `requests`) — they are not part of the automated suite.
+- iOS is unbuilt here (XcodeGen project + signing; no iOS changes this round).
+- **Known test gaps (accepted):** the worker `worker_name_url` reporting-identity change and the
+  `assign_upload` WS call-site are integration-level (need a mock HTTP server / live `WsStream`) and
+  were not pinned to avoid brittle tests or production-code changes; their guards are covered indirectly
+  (queue-side ownership test; the pure `path_in_scan_dirs` helper).

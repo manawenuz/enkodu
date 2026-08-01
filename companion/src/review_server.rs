@@ -39,7 +39,7 @@ impl ReviewServer {
 
         std::thread::spawn(move || {
             for req in server.incoming_requests() {
-                dispatch(req, &live_cfg);
+                dispatch(req, &live_cfg, port);
             }
         });
 
@@ -57,16 +57,14 @@ fn no_cache() -> Header {
     Header::from_bytes("Cache-Control", "no-store").unwrap()
 }
 
-fn cors() -> Header {
-    Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap()
-}
-
 fn json_ok(body: impl Serialize) -> Response<std::io::Cursor<Vec<u8>>> {
+    // SECURITY (COMP-1): no Access-Control-Allow-Origin header. The review UI is
+    // served same-origin from this very server, so cross-origin reads of /api
+    // (which expose config) must be blocked.
     let s = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
     Response::from_data(s.into_bytes())
         .with_header(content_type("application/json"))
         .with_header(no_cache())
-        .with_header(cors())
 }
 
 fn json_err(msg: &str, code: u16) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -90,7 +88,49 @@ fn path_only(url: &str) -> &str {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-fn dispatch(mut req: Request, live_cfg: &Arc<RwLock<Config>>) {
+/// SECURITY (COMP-1): defeat DNS-rebinding by requiring the Host header to be a
+/// loopback host on this exact port, and rejecting any cross-origin request.
+/// Returns true if the request is allowed to proceed.
+fn host_origin_ok(req: &Request, port: u16) -> bool {
+    let mut host: Option<String> = None;
+    let mut origin: Option<String> = None;
+    for h in req.headers() {
+        let field = h.field.as_str().as_str().to_ascii_lowercase();
+        if field == "host" {
+            host = Some(h.value.as_str().to_string());
+        } else if field == "origin" {
+            origin = Some(h.value.as_str().to_string());
+        }
+    }
+    host_origin_allowed(host.as_deref(), origin.as_deref(), port)
+}
+
+/// Pure decision for [`host_origin_ok`]: the Host header must be a loopback host
+/// on this exact `port`, and any present Origin must point at that same loopback
+/// origin. A missing Host fails closed; a missing Origin is allowed (browsers
+/// only send Origin on cross-origin / non-simple requests).
+fn host_origin_allowed(host: Option<&str>, origin: Option<&str>, port: u16) -> bool {
+    let allowed = [
+        format!("127.0.0.1:{}", port),
+        format!("localhost:{}", port),
+    ];
+    let host_ok = match host {
+        Some(v) => allowed.iter().any(|a| a == v),
+        None => false,
+    };
+    let origin_ok = match origin {
+        Some(v) => allowed.iter().any(|a| v == format!("http://{}", a)),
+        None => true,
+    };
+    host_ok && origin_ok
+}
+
+fn dispatch(mut req: Request, live_cfg: &Arc<RwLock<Config>>, port: u16) {
+    if !host_origin_ok(&req, port) {
+        let _ = req.respond(json_err("forbidden", 403));
+        return;
+    }
+
     let url = req.url().to_string();
     let path = path_only(&url).to_string();
     let method = req.method().clone();
@@ -162,8 +202,39 @@ fn get_pending_review() -> Vec<state::JobEntry> {
         .collect()
 }
 
+/// Sentinel returned in place of the real auth_token so the secret never leaves
+/// the process. The UI only needs to know whether a token is set.
+const TOKEN_SENTINEL: &str = "__SET__";
+
+/// SECURITY (COMP-1): replace a set `auth_token` (the bearer credential for the
+/// queue server) with the sentinel so the real secret never leaves the process.
+/// A `None` token stays `None`.
+fn redact_config(mut cfg: Config) -> Config {
+    cfg.auth_token = cfg
+        .auth_token
+        .as_ref()
+        .map(|_| TOKEN_SENTINEL.to_string());
+    cfg
+}
+
+/// SECURITY (COMP-1): when a posted config echoes the redaction sentinel back as
+/// its `auth_token`, keep the existing real token instead of clobbering it with
+/// the placeholder. Any other value (including `None`) is taken verbatim.
+fn resolve_posted_token(
+    posted: Option<String>,
+    existing: Option<String>,
+) -> Option<String> {
+    if posted.as_deref() == Some(TOKEN_SENTINEL) {
+        existing
+    } else {
+        posted
+    }
+}
+
 fn get_config(live_cfg: &Arc<RwLock<Config>>) -> Response<std::io::Cursor<Vec<u8>>> {
-    let cfg = live_cfg.read().unwrap().clone();
+    // SECURITY (COMP-1): never serialize the real auth_token (the bearer
+    // credential for the queue server). Redact it to a sentinel.
+    let cfg = redact_config(live_cfg.read().unwrap().clone());
     json_ok(cfg)
 }
 
@@ -307,16 +378,24 @@ fn post_config(
         Ok(b) => b,
         Err(e) => return json_err(&e.to_string(), 400),
     };
-    let new_cfg: Config = match serde_json::from_str(&body) {
+    let mut new_cfg: Config = match serde_json::from_str(&body) {
         Ok(c) => c,
         Err(e) => return json_err(&e.to_string(), 400),
     };
+    // SECURITY (COMP-1): get_config redacts auth_token to a sentinel. If the
+    // client echoes the sentinel back, preserve the existing real token instead
+    // of clobbering it with the placeholder.
+    new_cfg.auth_token = resolve_posted_token(
+        new_cfg.auth_token.take(),
+        live_cfg.read().unwrap().auth_token.clone(),
+    );
     if let Err(e) = new_cfg.save() {
         return json_err(&format!("save failed: {}", e), 500);
     }
     *live_cfg.write().unwrap() = new_cfg.clone();
     info!("Config updated via review UI");
-    json_ok(new_cfg)
+    // Re-redact before returning so the response never carries the real token.
+    json_ok(redact_config(new_cfg))
 }
 
 // ── Accept / Reject logic ─────────────────────────────────────────────────────
@@ -373,6 +452,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_ok_emits_no_cors_header() {
+        // COMP-1: the wildcard Access-Control-Allow-Origin header was removed so
+        // the review UI's /api responses (which expose config) cannot be read
+        // cross-origin. A regression re-adding any ACAO header must be caught here.
+        let resp = json_ok(serde_json::json!({"ok": true}));
+        let has_acao = resp.headers().iter().any(|h| {
+            h.field.as_str().as_str().eq_ignore_ascii_case("Access-Control-Allow-Origin")
+        });
+        assert!(!has_acao, "json_ok must not set Access-Control-Allow-Origin");
+    }
+
+    #[test]
     fn path_only_strips_query() {
         assert_eq!(path_only("/api/jobs?x=1"), "/api/jobs");
         assert_eq!(path_only("/api/jobs"), "/api/jobs");
@@ -393,6 +484,127 @@ mod tests {
     fn review_html_is_embedded() {
         assert!(REVIEW_HTML.contains("ENKODU"));
         assert!(REVIEW_HTML.contains("review_mode") || REVIEW_HTML.contains("Review Mode"));
+    }
+
+    fn cfg_with_token(token: Option<&str>) -> Config {
+        let mut cfg = Config::default();
+        cfg.auth_token = token.map(|s| s.to_string());
+        cfg
+    }
+
+    // ── COMP-1 (a): get_config redacts the real token to the sentinel ───────
+
+    #[test]
+    fn redact_config_replaces_real_token_with_sentinel() {
+        let redacted = redact_config(cfg_with_token(Some("REAL-BEARER-TOKEN")));
+        // Before the fix get_config serialized the live config verbatim, leaking
+        // the bearer credential to any /api/config reader.
+        assert_eq!(redacted.auth_token.as_deref(), Some(TOKEN_SENTINEL));
+        assert_ne!(redacted.auth_token.as_deref(), Some("REAL-BEARER-TOKEN"));
+    }
+
+    #[test]
+    fn redact_config_leaves_unset_token_none() {
+        let redacted = redact_config(cfg_with_token(None));
+        assert_eq!(redacted.auth_token, None);
+    }
+
+    #[test]
+    fn get_config_response_never_contains_real_token() {
+        let live = Arc::new(RwLock::new(cfg_with_token(Some("REAL-BEARER-TOKEN"))));
+        let resp = get_config(&live);
+        // Drain the response body and assert the secret is absent / sentinel present.
+        let mut reader = resp.into_reader();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut body).unwrap();
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            !text.contains("REAL-BEARER-TOKEN"),
+            "serialized config leaked the real token: {}",
+            text
+        );
+        assert!(text.contains(TOKEN_SENTINEL));
+    }
+
+    // ── COMP-1 (b): post_config sentinel round-trip preserves the real token ─
+
+    #[test]
+    fn resolve_posted_token_preserves_real_token_on_sentinel_echo() {
+        // Client echoes the sentinel back ⇒ keep the existing real token.
+        // Before the fix the sentinel string would have been saved AS the token,
+        // silently destroying the real bearer credential.
+        let resolved = resolve_posted_token(
+            Some(TOKEN_SENTINEL.to_string()),
+            Some("REAL-BEARER-TOKEN".to_string()),
+        );
+        assert_eq!(resolved.as_deref(), Some("REAL-BEARER-TOKEN"));
+    }
+
+    #[test]
+    fn resolve_posted_token_sets_new_distinct_token() {
+        let resolved = resolve_posted_token(
+            Some("BRAND-NEW-TOKEN".to_string()),
+            Some("REAL-BEARER-TOKEN".to_string()),
+        );
+        assert_eq!(resolved.as_deref(), Some("BRAND-NEW-TOKEN"));
+    }
+
+    #[test]
+    fn resolve_posted_token_allows_clearing_token() {
+        let resolved =
+            resolve_posted_token(None, Some("REAL-BEARER-TOKEN".to_string()));
+        assert_eq!(resolved, None);
+    }
+
+    // ── COMP-1: host_origin_ok (via pure host_origin_allowed) ───────────────
+
+    #[test]
+    fn host_origin_allowed_accepts_loopback_hosts() {
+        // Matching loopback Host, no Origin.
+        assert!(host_origin_allowed(Some("127.0.0.1:8080"), None, 8080));
+        assert!(host_origin_allowed(Some("localhost:8080"), None, 8080));
+        // Matching loopback Host AND matching loopback Origin.
+        assert!(host_origin_allowed(
+            Some("127.0.0.1:8080"),
+            Some("http://127.0.0.1:8080"),
+            8080
+        ));
+        assert!(host_origin_allowed(
+            Some("localhost:8080"),
+            Some("http://localhost:8080"),
+            8080
+        ));
+    }
+
+    #[test]
+    fn host_origin_allowed_rejects_foreign_host() {
+        // DNS-rebinding: a foreign Host resolving to loopback must be rejected.
+        assert!(!host_origin_allowed(Some("evil.com"), None, 8080));
+        assert!(!host_origin_allowed(Some("evil.com:8080"), None, 8080));
+        // Right host, wrong port.
+        assert!(!host_origin_allowed(Some("127.0.0.1:9999"), None, 8080));
+    }
+
+    #[test]
+    fn host_origin_allowed_rejects_missing_host() {
+        // No Host header ⇒ fail closed.
+        assert!(!host_origin_allowed(None, None, 8080));
+        assert!(!host_origin_allowed(None, Some("http://127.0.0.1:8080"), 8080));
+    }
+
+    #[test]
+    fn host_origin_allowed_rejects_cross_origin() {
+        // Good loopback Host but a cross-origin Origin ⇒ rejected.
+        assert!(!host_origin_allowed(
+            Some("127.0.0.1:8080"),
+            Some("http://evil.com"),
+            8080
+        ));
+        assert!(!host_origin_allowed(
+            Some("127.0.0.1:8080"),
+            Some("https://127.0.0.1:8080"),
+            8080
+        ));
     }
 }
 

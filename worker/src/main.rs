@@ -135,6 +135,22 @@ fn sanitize_worker_name(name: &str) -> String {
         .collect()
 }
 
+// Validate a server-supplied job id before it is ever used as a filesystem
+// path component. The id is used to build the per-job work_dir, which is
+// create_dir_all'd, written into, and remove_dir_all'd; a malicious/compromised
+// queue could otherwise supply an absolute path or one containing ".." to
+// escape work_dir and create/write/delete arbitrary directories. UUIDs (the
+// queue's normal ids) satisfy this; anything with a path separator, "..", an
+// absolute prefix, empty, or longer than 64 chars is rejected.
+fn is_safe_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -501,7 +517,16 @@ fn poll_job(cfg: &Config) -> Result<Option<Job>> {
         s if !(200..300).contains(&(s as i32)) => bail!("GET /jobs/next returned {}", s),
         _ => {}
     }
-    Ok(Some(resp.json().context("parse job")?))
+    let job: Job = resp.json().context("parse job")?;
+    if !is_safe_job_id(&job.id) {
+        log_error(
+            cfg,
+            Some(&job.id),
+            "Rejecting job with unsafe id from queue (must match [A-Za-z0-9_-]{1,64}); skipping",
+        );
+        return Ok(None);
+    }
+    Ok(Some(job))
 }
 
 fn download_source(cfg: &Config, job: &Job, dest: &PathBuf) -> Result<()> {
@@ -549,7 +574,7 @@ fn report_progress(
     let url = format!("{}/jobs/{}/progress", cfg.queue_url, job_id);
     let _ = with_auth(
         http().post(&url).json(&ProgressPayload {
-            worker: cfg.worker_name.clone(),
+            worker: cfg.worker_name_url.clone(),
             phase: "encoding".to_string(),
             percent,
             fps,
@@ -567,7 +592,7 @@ fn report_phase(cfg: &Config, job_id: &str, phase: &str) {
     let url = format!("{}/jobs/{}/progress", cfg.queue_url, job_id);
     let _ = with_auth(
         http().post(&url).json(&ProgressPayload {
-            worker: cfg.worker_name.clone(),
+            worker: cfg.worker_name_url.clone(),
             phase: phase.to_string(),
             percent: 100.0,
             fps: 0.0,
@@ -585,7 +610,9 @@ fn report_done(cfg: &Config, job_id: &str, output_size: u64) -> Result<()> {
     let url = format!("{}/jobs/{}/done", cfg.queue_url, job_id);
     let resp = with_auth(
         http().post(&url).json(&DonePayload {
-            worker: cfg.worker_name.clone(),
+            // Must match the identity used to claim the job (GET /jobs/next?worker=)
+            // so the queue's ownership guard accepts the completion.
+            worker: cfg.worker_name_url.clone(),
             output_size,
         }),
         cfg,
@@ -614,7 +641,9 @@ fn report_failed(cfg: &Config, job_id: &str, error: &str) {
     let url = format!("{}/jobs/{}/failed", cfg.queue_url, job_id);
     match with_auth(
         http().post(&url).json(&FailedPayload {
-            worker: cfg.worker_name.clone(),
+            // Must match the claim identity (GET /jobs/next?worker=) for the
+            // queue's ownership guard to accept the failure report.
+            worker: cfg.worker_name_url.clone(),
             error: error.to_string(),
         }),
         cfg,
@@ -1150,7 +1179,18 @@ fn warn_env_file_permissions(_: &Config, _: &str) {}
 // ── job loop ──────────────────────────────────────────────────────────────────
 
 fn process_job(cfg: &Config, job: &Job, ffmpeg_child: &Arc<Mutex<Option<Child>>>) -> Result<bool> {
+    // Defense in depth: job.id is validated at the deserialization boundary
+    // (is_safe_job_id), but re-assert here that the resolved work_dir cannot
+    // escape cfg.work_dir before we create/write/delete anything under it.
+    if !is_safe_job_id(&job.id) {
+        bail!("refusing to process job with unsafe id");
+    }
     let work_dir = cfg.work_dir.join(&job.id);
+    if !work_dir.starts_with(&cfg.work_dir)
+        || work_dir.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("refusing to process job: work_dir escapes base directory");
+    }
     fs::create_dir_all(&work_dir).context("create work dir")?;
 
     let input = work_dir.join("input.mp4");
@@ -1272,6 +1312,11 @@ fn fetch_job_by_id(cfg: &Config, job_id: &str, output_codec: &str) -> Result<Job
         bail!("GET /jobs/{} returned {}", job_id, resp.status());
     }
     let mut job: Job = resp.json().context("parse job")?;
+    if !is_safe_job_id(&job.id) {
+        bail!(
+            "Rejecting job with unsafe id from queue (must match [A-Za-z0-9_-]{{1,64}})"
+        );
+    }
     if job.output_codec.is_empty() {
         job.output_codec = output_codec.to_string();
     }
@@ -1991,5 +2036,181 @@ exit 1
         let map = load_env_file(f.path().to_str().unwrap());
         assert_eq!(map["MY_KEY"], "hello");
         assert_eq!(map["OTHER"], "world");
+    }
+
+    // ── WORKER-1: is_safe_job_id() — server-controlled job.id is validated
+    // before being used as a filesystem path component. ──────────────────────
+    //
+    // Pre-fix behavior: there was no is_safe_job_id guard at all; the raw
+    // server-supplied job.id was joined onto cfg.work_dir and then
+    // create_dir_all'd / written into / remove_dir_all'd. A compromised or
+    // malicious queue could return an id like "../../etc", "/abs",
+    // "a/../b", or "C:\\Windows" and the worker would create/write/delete
+    // arbitrary directories outside its sandbox. These tests pin the exact
+    // secure guard: every rejected case below would have been ACCEPTED (and
+    // used as a path) before the fix, so each assert_eq!(false, ...) here
+    // would have tripped on the pre-fix code path.
+
+    #[test]
+    fn test_is_safe_job_id_accepts_normal_uuid() {
+        // A real queue UUID — the normal happy path. Must be accepted both
+        // before and after the fix; this anchors that the guard is not
+        // over-broad and does not break legitimate jobs.
+        assert!(is_safe_job_id("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn test_is_safe_job_id_accepts_simple_ids() {
+        assert!(is_safe_job_id("job_1"));
+        assert!(is_safe_job_id("abc-DEF_123"));
+        // Single char and the full 64-char boundary (inclusive) are allowed.
+        assert!(is_safe_job_id("a"));
+        let exactly_64 = "a".repeat(64);
+        assert!(is_safe_job_id(&exactly_64), "64 chars is the inclusive max");
+    }
+
+    #[test]
+    fn test_is_safe_job_id_rejects_empty() {
+        // Pre-fix: "" joined onto work_dir yields work_dir itself, so the
+        // worker would create_dir_all then remove_dir_all its OWN base jobs
+        // dir. The guard now rejects it.
+        assert!(!is_safe_job_id(""));
+    }
+
+    #[test]
+    fn test_is_safe_job_id_rejects_too_long() {
+        // 65 chars — one past the inclusive 64-char limit.
+        let too_long = "a".repeat(65);
+        assert!(!is_safe_job_id(&too_long));
+        // A very long id is also rejected regardless of charset.
+        assert!(!is_safe_job_id(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn test_is_safe_job_id_rejects_dotdot() {
+        // The core path-traversal token. Pre-fix these would have been used
+        // verbatim as path components and escaped work_dir.
+        assert!(!is_safe_job_id(".."));
+        assert!(!is_safe_job_id("../x"));
+        assert!(!is_safe_job_id("a/../b"));
+        assert!(!is_safe_job_id("a.."));
+        assert!(!is_safe_job_id("..a"));
+        // Even an embedded ".." with no separators is rejected (contains check).
+        assert!(!is_safe_job_id("foo..bar"));
+    }
+
+    #[test]
+    fn test_is_safe_job_id_rejects_path_separators() {
+        // Forward slash (unix) and backslash (windows) path separators.
+        assert!(!is_safe_job_id("a/b"));
+        assert!(!is_safe_job_id("a\\b"));
+        // Absolute paths.
+        assert!(!is_safe_job_id("/abs"));
+        assert!(!is_safe_job_id("C:\\x"));
+        assert!(!is_safe_job_id("\\\\server\\share"));
+    }
+
+    #[test]
+    fn test_is_safe_job_id_rejects_spaces_and_special_chars() {
+        // Spaces and anything outside [A-Za-z0-9_-].
+        assert!(!is_safe_job_id("has space"));
+        assert!(!is_safe_job_id(" leadingspace"));
+        assert!(!is_safe_job_id("trailing "));
+        assert!(!is_safe_job_id("a.b"));   // dot alone is not allowed
+        assert!(!is_safe_job_id("a;b"));
+        assert!(!is_safe_job_id("a|b"));
+        assert!(!is_safe_job_id("a:b"));
+        assert!(!is_safe_job_id("a*b"));
+        assert!(!is_safe_job_id("a$b"));
+        assert!(!is_safe_job_id("a\0b"));  // NUL byte
+        assert!(!is_safe_job_id("a\tb"));  // tab
+        assert!(!is_safe_job_id("a\nb"));  // newline
+        assert!(!is_safe_job_id("naïve")); // non-ASCII alphanumeric
+        assert!(!is_safe_job_id("①"));      // non-ASCII digit-like
+    }
+
+    // ── WORKER-1: process_job() bails on an unsafe id BEFORE touching the FS ──
+    //
+    // This exercises the real production guard (the is_safe_job_id re-check at
+    // the top of process_job) end-to-end without ffmpeg or a live server.
+    // Pre-fix there was no such bail, so process_job would have proceeded to
+    // create_dir_all(work_dir) on an attacker-controlled path. We assert it
+    // returns Err with the documented message AND that nothing was written
+    // under the work_dir base.
+
+    #[test]
+    fn test_process_job_rejects_unsafe_id_without_touching_fs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config();
+        cfg.work_dir = tmp.path().join("jobs");
+
+        let ffmpeg_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        for bad in ["../escape", "a/b", "", "/abs", "..", "C:\\x"] {
+            let job = Job {
+                id: bad.to_string(),
+                source_duration_secs: 10.0,
+                output_codec: "av1".into(),
+            };
+            let res = process_job(&cfg, &job, &ffmpeg_child);
+            assert!(
+                res.is_err(),
+                "process_job must refuse unsafe id {:?}",
+                bad
+            );
+            let msg = res.unwrap_err().to_string();
+            assert!(
+                msg.contains("unsafe id") || msg.contains("escapes base directory"),
+                "unexpected error for {:?}: {}",
+                bad,
+                msg
+            );
+        }
+
+        // The guard must bail before any filesystem mutation: the work_dir
+        // base must not even have been created.
+        assert!(
+            !cfg.work_dir.exists(),
+            "process_job created work_dir base while rejecting unsafe ids"
+        );
+    }
+
+    // ── WORKER-1: lexical containment logic (process_job's second guard) ──────
+    //
+    // process_job re-asserts, after is_safe_job_id, that the resolved work_dir
+    // is lexically contained in cfg.work_dir:
+    //     work_dir = cfg.work_dir.join(&job.id);
+    //     if !work_dir.starts_with(&cfg.work_dir)
+    //        || work_dir.components().any(|c| matches == Component::ParentDir)
+    // Because is_safe_job_id already rejects every escape sequence, this branch
+    // is not reachable through process_job with a real id. To pin the
+    // containment LOGIC itself (so a future refactor that loosens
+    // is_safe_job_id can't silently let an escape through this second layer),
+    // we replicate the exact lexical check here as a pure, test-only helper.
+    // This duplicates production logic verbatim; it does NOT change runtime
+    // behavior.
+    fn work_dir_is_contained(base: &std::path::Path, id: &str) -> bool {
+        let work_dir = base.join(id);
+        work_dir.starts_with(base)
+            && !work_dir
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+
+    #[test]
+    fn test_work_dir_containment_logic() {
+        let base = PathBuf::from("/tmp/yulia-worker/jobs");
+
+        // Normal ids stay contained.
+        assert!(work_dir_is_contained(&base, "550e8400-e29b-41d4-a716-446655440000"));
+        assert!(work_dir_is_contained(&base, "job_1"));
+
+        // A ".." component escapes via ParentDir — must be rejected.
+        assert!(!work_dir_is_contained(&base, "../escape"));
+        assert!(!work_dir_is_contained(&base, "a/../../etc"));
+
+        // An absolute id replaces the base entirely (join semantics), so the
+        // result no longer starts_with the base — must be rejected.
+        assert!(!work_dir_is_contained(&base, "/abs/path"));
     }
 }
