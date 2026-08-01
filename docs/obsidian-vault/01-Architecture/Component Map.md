@@ -23,6 +23,8 @@ Responsibilities:
 - Optional auth: local passkeys, Authentik OIDC, Jellyfin login, worker tokens, companion tokens, and API tokens.
 - Health/version probes and telemetry ingestion.
 - Dashboard, install page, companion binary download.
+- Companion registry, capability reporting, pending remote configuration, and live WebSocket updates for worker control, job progress, and file manifests.
+- File-pool discovery and explicit queue-plan build/reorder operations for companion-managed libraries.
 - Operational actions: scan, force encode, requeue, rescan, clear failed/pending, backfill metadata, delete originals, control run/drain/stop.
 
 Runtime:
@@ -86,7 +88,11 @@ Current assumptions:
 - Linux uses `notify-send`, XDG autostart, and Unix-socket IPC.
 - Windows uses `%APPDATA%`/`%LOCALAPPDATA%`, HKCU Run autostart, and localhost loopback IPC with a per-run token.
 - `ffprobe` must be available in PATH, Homebrew, or `/usr/local/bin`.
-- `enkodu --version` is still missing.
+- `enkodu --version`/`-V` reports the packaged companion version.
+
+### Live coordination
+
+The companion first registers its stable ID and capabilities, then connects to `WS /ws/companion/{id}`. It sends a hello message, periodic heartbeats, and file manifests discovered by local scanning. The server sends welcome/config/control/job messages; configuration is acknowledged before the server clears a pending configuration update. WebSocket auth uses the companion bearer token when strict auth is enabled.
 
 ## Mobile Companions
 

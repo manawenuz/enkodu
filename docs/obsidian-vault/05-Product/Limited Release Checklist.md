@@ -35,9 +35,11 @@ Only the queue, Windows worker, and macOS companion are in the narrow release sh
 - [x] Wire worker and companion clients to send configured bearer tokens.
 - [ ] Run a deployment dry-run with `AUTH_LEGACY_MACHINE_ACCESS=false`.
 - [x] Add a version string to worker binary and expose it in logs/diagnostics.
-- [ ] Add `enkodu --version` / `enkodu -V` for the desktop companion.
+- [x] Add `enkodu --version` / `enkodu -V` for the desktop companion.
 
 ## P1 Strongly Recommended
+
+The current implementation also includes companion registration/capabilities, live WebSocket coordination, file-pool discovery and queue planning, health/version probes, bounded telemetry, auth bootstrap/admin invites, and separate worker/companion tokens. These need operational validation even though they are not all first-release blockers.
 
 - [x] Worker config file instead of env-only/default-path setup.
 - [x] Worker diagnostics command that checks queue, ffmpeg, ffprobe, encoder availability, and auth token acceptance when configured.

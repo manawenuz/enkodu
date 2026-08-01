@@ -16,6 +16,8 @@ graph LR
     Uploads["/data/.transcode/uploads<br/>companion uploads"]
     Auth["Auth tables<br/>users/passkeys/sessions"]
     Telemetry["Telemetry table"]
+    FilePool["Companion file pool"]
+    QueuePlan["Queue plan / ordering"]
     Dashboard["Web dashboard<br/>/"]
   end
 
@@ -44,6 +46,8 @@ graph LR
   Queue <--> DB
   Queue <--> Auth
   Queue <--> Telemetry
+  Queue <--> FilePool
+  Queue <--> QueuePlan
   Queue <--> Control
   Queue --> Videos
   Queue --> Uploads
@@ -69,12 +73,15 @@ graph LR
   Tray -- "GET /jobs/{id}/output" --> Queue
   Tray -- "POST /clients/queue-manifest" --> Queue
   Tray -- "GET /jobs/{id}/checksum" --> Queue
+  Tray -- "WS /ws/companion/{id}" --> Queue
 
   MobileUI --> MobileAuth
   MobileUI --> TransferState
   MobileUI -- "POST /jobs/upload/resumable/*" --> Queue
   MobileUI -- "GET /jobs/{id}/output<br/>Range" --> Queue
   MobileUI -- "POST /telemetry" --> Queue
+
+  Queue -. "live config, control, progress, file manifests" .-> Tray
 ```
 
 ## Maps

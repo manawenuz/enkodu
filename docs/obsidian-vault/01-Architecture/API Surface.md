@@ -18,6 +18,8 @@ When `AUTH_ENABLED=true`, browser/operator endpoints require a local passkey, Au
 | GET | `/auth/setup?token=...` | One-time passkey registration page |
 | GET | `/auth/me` | Return current session user |
 | POST | `/auth/logout` | Revoke current session |
+| POST | `/auth/admin/invite` | Create an invite/setup URL for an existing user |
+| POST | `/auth/bootstrap` | Create the initial admin setup flow when no users exist |
 | GET | `/auth/jellyfin/login` | Jellyfin login page |
 | POST | `/auth/jellyfin/login` | Verify Jellyfin credentials and create Enkodu session |
 | POST | `/auth/passkey/register/options` | Generate WebAuthn registration options |
@@ -48,6 +50,13 @@ When `AUTH_ENABLED=true`, browser/operator endpoints require a local passkey, Au
 | GET | `/clients` | List known companion/upload clients and queued manifest counts |
 | POST | `/clients/weights` | Update client scheduling weights |
 | POST | `/clients/queue-manifest` | Report companion scan queue manifest |
+| POST | `/companions/{cid}/register` | Register or refresh a desktop companion |
+| GET | `/companions/{cid}/config` | Read pending/current companion configuration |
+| PUT | `/companions/{cid}/config` | Set companion configuration |
+| POST | `/companions/{cid}/capabilities` | Publish platform and codec capabilities |
+| GET | `/companions` | List registered companions and last-seen state |
+| POST | `/companions/{cid}/promote` | Promote a companion into the active coordination role |
+| WS | `/ws/{kind}/{cid}` | Live worker/companion connection for hello, heartbeats, config, control, progress, and file manifests |
 | POST | `/telemetry` | Accept bounded client events; rejects likely secrets and path-heavy detail |
 | GET | `/telemetry/summary?days=7` | Aggregate event totals by event type and platform |
 
@@ -100,6 +109,16 @@ Notes:
 | POST | `/jobs/bulk-delete-original` | Delete originals per job, requiring verified pass for each |
 | POST | `/jobs/clear-pending` | Delete pending jobs |
 | POST | `/jobs/clear-failed` | Delete failed jobs |
+
+## File pool and queue planning
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/file-pool` | List companion-discovered files |
+| POST | `/file-pool/exclude/{pool_id}` | Exclude a discovered file from planning |
+| GET | `/queue-plan` | Read the current planned order |
+| POST | `/queue-plan/reorder` | Reorder planned files |
+| POST | `/file-pool/build-queue` | Turn planned files into queue jobs |
 
 ## Release API Gaps
 

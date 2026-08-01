@@ -8,11 +8,11 @@ created: 2026-06-09
 
 # Enkodu Project Vault
 
-Enkodu, in this repo still named `YuliaAV1`, is a distributed AV1 transcoding system. The current spine is:
+Enkodu is a distributed AV1 transcoding system. The public repository is [`manawenuz/enkodu`](https://github.com/manawenuz/enkodu). The current spine is:
 
 - A Linux/NAS-hosted FastAPI queue service in `queue/main.py`.
 - A stateless Rust worker in `worker/src/main.rs` with Windows and Linux defaults, encoder probing, diagnostics, and bearer-token auth.
-- A Rust desktop companion in `companion/src/main.rs` with macOS, Linux, and Windows platform adapters.
+- A Rust desktop companion in `companion/src/main.rs` with macOS, Linux, and Windows platform adapters, local file discovery, IPC, and a live WebSocket connection.
 - Native Android and iOS companion scaffolds under `mobile/`, both still pre-release.
 
 ## Start Here
@@ -38,7 +38,7 @@ The smallest coherent release is:
 
 > Linux queue service + Windows worker + macOS companion, for trusted users on a private network/Tailscale, with originals never replaced automatically unless explicitly configured.
 
-The queue now has opt-in auth, verified-output gates on download/checksum/delete actions, resumable uploads, ranged downloads, telemetry, and health/version probes. The remaining core safety decision is semantic: `status=done` still means "worker uploaded output"; clients must continue requiring `verify_status=pass` before download, checksum, delete, replacement, or save/share actions.
+The queue now has opt-in auth, passkey/Authentik/Jellyfin login options, worker and companion bearer tokens, verified-output gates on download/checksum/delete actions, resumable uploads, ranged downloads, telemetry, health/version probes, and WebSocket coordination. It also maintains a companion file pool and queue plan so clients can report discovered files and operators can build/reorder work before submission. The remaining core safety decision is semantic: `status=done` still means "worker uploaded output"; clients must continue requiring `verify_status=pass` before download, checksum, delete, replacement, or save/share actions.
 
 Linux companion, Linux worker, Windows companion, Android companion, and iOS companion all have implementation scaffolding. They are useful follow-ons, but they should not block the first limited release unless the release audience requires them and there is real-platform verification.
 
@@ -53,8 +53,9 @@ Linux companion, Linux worker, Windows companion, Android companion, and iOS com
 - Companion API client: `companion/src/api.rs`
 - Companion scan/reconcile: `companion/src/scan.rs`, `companion/src/reconcile.rs`
 - Older companion PRD: `companion/PRD.md`
+- Public project documentation: `README.md`
 - Agent notes: `AGENTS.md`, `CLAUDE.md`
 
 ## Naming
 
-The repository and older docs use `YuliaAV1`; the code and UI now mostly use `Enkodu`. Treat `Enkodu` as the product name and `YuliaAV1` as the historical repo/project name until renamed.
+Some worker binaries, environment paths, and historical notes still use `YuliaAV1`/`yulia-worker`. Treat `Enkodu` as the product name and those names as compatibility or historical identifiers.

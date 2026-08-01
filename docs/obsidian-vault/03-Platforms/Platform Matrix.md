@@ -15,9 +15,9 @@ Legend:
 
 | Platform | Queue | Companion | Worker | Current Read |
 |---|---:|---:|---:|---|
-| Linux / NAS | + | ~ | ~ | Queue is real; Linux companion adapter exists; Linux worker install/docs/encoder profiles exist, but need real host diagnostics and fixture run |
+| Linux / NAS | + | ~ | ~ | Queue, auth, file-pool planning, and WebSocket coordination are real; Linux companion adapter and worker install/docs/encoder profiles exist, but need real host diagnostics and fixture run |
 | macOS | N/A | ~ | - | Companion exists but needs packaging/signing; worker is not implemented |
-| Windows | N/A | ~ | ~ | Worker install/docs/diagnostics exist; companion adapter has paths, HKCU autostart, and loopback IPC; both need real Windows fixture verification |
+| Windows | N/A | ~ | ~ | Worker install/docs/diagnostics and Scheduled Task flow exist; companion adapter has paths, HKCU autostart, loopback IPC, and WebSocket coordination; both need real Windows fixture verification |
 | Android | N/A | ~ | - | Native companion scaffold exists with AV1 gate, auth storage, Retrofit, Room, WorkManager transfer pieces; not release-ready |
 | iOS | N/A | ~ | - | Native companion scaffold exists with AV1 gate, Keychain, Core Data, URLSession transfer pieces; not release-ready |
 

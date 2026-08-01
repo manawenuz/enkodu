@@ -62,6 +62,8 @@ sequenceDiagram
   W->>Q: POST /jobs/{id}/done
 ```
 
+When WebSocket mode is enabled, the worker also connects to `WS /ws/worker/{name}` over `ws://` or `wss://`, sends version/capability information, receives control state, and can receive live coordination without relying exclusively on polling. HTTP remains the durable job API and fallback path.
+
 ## Encoder Selection
 
 If `ENCODER` is set, the worker uses it directly. If it is empty, the worker probes encoders with a one-second null encode and picks the first successful candidate:
@@ -96,7 +98,7 @@ ffmpeg -i input.mp4 -c:v av1_qsv -global_quality 28 -preset medium -c:a aac -b:a
 - No macOS worker target.
 - Stop command kills ffmpeg, but job cleanup depends on subsequent error handling and stale cleanup.
 - Local validation only checks codec and duration.
-- Server marks `status=done` before async server verification completes, so clients must require `verify_status=pass`.
+- Server marks `status=done` before async server verification completes, so clients must require `verify_status=pass` before treating output as safe.
 
 ## Diagnostics and Auth
 

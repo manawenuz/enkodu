@@ -35,6 +35,8 @@ sequenceDiagram
   C-->>User: Notification
 ```
 
+At startup the desktop companion registers its stable ID and capabilities, fetches any pending remote configuration, and opens `WS /ws/companion/{id}`. The connection carries live control/configuration and progress messages. Local scanning periodically publishes a file manifest to the queue's file pool; operators can inspect, exclude, reorder, and build that pool into jobs through the queue-plan API.
+
 ## Mobile / Resumable Variant
 
 ```mermaid

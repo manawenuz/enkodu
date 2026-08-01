@@ -12,9 +12,9 @@ Enkodu is a distributed AV1 transcoding pipeline. The queue service owns all dur
 
 | Component | Status | Role | Source |
 |---|---:|---|---|
-| Queue service | Present | Scans NAS videos, stores jobs in SQLite, serves dashboard/API, accepts uploads, dispatches work, verifies outputs, enforces optional auth | `queue/main.py` |
+| Queue service | Present | Scans NAS videos, stores jobs in SQLite, serves dashboard/API, accepts uploads, dispatches work, verifies outputs, enforces optional auth, and coordinates registered companions over WebSocket | `queue/main.py` |
 | Worker | Present, needs fixture evidence | Polls for one job, downloads source over HTTP, probes encoder support, encodes AV1, validates locally, uploads output | `worker/src/main.rs` |
-| macOS companion | Present, needs packaging | Tray app, file submit, batch scan, queue controls, reconcile/download, LaunchAgent toggle | `companion/src/main.rs`, `companion/src/platform/macos.rs` |
+| macOS companion | Present, needs packaging | Tray app, file submit, batch scan, queue controls, reconcile/download, LaunchAgent toggle, WebSocket live state | `companion/src/main.rs`, `companion/src/platform/macos.rs` |
 | Linux companion | Present, needs real-desktop verification | Desktop adapter for notifications, XDG paths, autostart, and Unix-socket IPC | `companion/src/platform/linux.rs` |
 | Windows companion | Present, needs real-Windows verification | Desktop adapter for config/state paths, HKCU Run autostart, loopback IPC, and notification fallback | `companion/src/platform/windows.rs` |
 | Android companion | Scaffolded, not release-ready | Native app shell with auth storage, AV1 gate, Retrofit API, Room transfer state, WorkManager transfer pieces | `mobile/android/` |
@@ -47,6 +47,8 @@ Companion-origin job:
 4. Worker processes it like any other job.
 5. Client polls `GET /jobs/{id}` until `status=done` and `verify_status=pass`.
 6. Client downloads the output via `GET /jobs/{id}/output`, optionally with `Range`, then verifies checksum via `/jobs/{id}/checksum`.
+
+Desktop companions also register at `/companions/{id}/register`, publish capabilities, and maintain `WS /ws/companion/{id}`. The queue can send pending configuration, worker control state, live job updates, and queue/file-pool changes over that connection. A companion must be registered before the WebSocket is accepted.
 
 ## Current Safety Gap
 
