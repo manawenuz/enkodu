@@ -30,8 +30,8 @@ choco install -y rust visualstudio2022community ffmpeg
 
 ```powershell
 # Clone the repository (if not already done)
-git clone <repository-url>
-cd YuliaAV1\companion
+git clone https://github.com/manawenuz/enkodu.git
+cd enkodu\companion
 
 # Build for Windows (MSVC target)
 cargo build --release --target x86_64-pc-windows-msvc

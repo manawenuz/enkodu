@@ -19,7 +19,7 @@
 #>
 
 param(
-    [string]$BinaryUrl = "https://github.com/your-org/yulia-worker/releases/latest/download/yulia-worker.exe",
+    [string]$BinaryUrl = "https://github.com/manawenuz/enkodu/releases/latest/download/yulia-worker.exe",
     [string]$WorkerName = $env:COMPUTERNAME
 )
 

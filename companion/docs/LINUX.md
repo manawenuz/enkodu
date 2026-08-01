@@ -35,8 +35,8 @@ sudo pacman -S --needed rust libnotify xdg-utils ffmpeg
 
 ```bash
 # Clone the repository (if not already done)
-git clone <repository-url>
-cd YuliaAV1/companion
+git clone https://github.com/manawenuz/enkodu.git
+cd enkodu/companion
 
 # Build in release mode
 cargo build --release
